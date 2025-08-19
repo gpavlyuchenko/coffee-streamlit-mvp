@@ -11,50 +11,8 @@ from io import BytesIO
 
 st.set_page_config(page_title="Coffee Landed Cost — MVP", page_icon="☕", layout="wide")
 st.title("☕ Coffee Landed Cost — MVP")
-# ---------- Sidebar: market ----------
-with st.sidebar:
-    st.subheader("Рынок (бесплатные квоты) — Stooq/Yahoo")
-    data = get_live_prices()
-    kc = data.get("KC.F", {})
-    rm = data.get("RM.F", {})
-
-    colA, colB = st.columns(2)
-
-    with colA:
-        if "error" in kc:
-            st.error(kc["error"])
-        else:
-            st.metric("Arabica (KC)", f"{kc['last_raw']:.2f} {kc.get('unit','')}")
-            st.caption(f"≈ {kc['usdkg']:.3f} $/кг • Source: {kc.get('source','?')}")
-
-    with colB:
-        if "error" in rm:
-            st.error(rm["error"])
-        else:
-            st.metric("Robusta (RM)", f"{rm['last_raw']:.2f} {rm.get('unit','')}")
-            st.caption(f"≈ {rm['usdkg']:.3f} $/кг • Source: {rm.get('source','?')}")
-
-    st.caption("Квоты с задержкой. Для сделок сверяйте с брокером/биржей.")
 
 # ---------- Helpers ----------
-@st.cache_data(ttl=600)
-def fetch_stooq_csv(symbol: str, interval: str = "d") -> pd.DataFrame:
-    url = f"https://stooq.com/q/d/l/?s={symbol}&i={interval}"
-    r = requests.get(url, timeout=10)
-    if r.status_code != 200 or not r.text.strip():
-        url = f"https://stooq.pl/q/d/l/?s={symbol}&i={interval}"
-        r = requests.get(url, timeout=10)
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
-    df.columns = [c.strip().lower() for c in df.columns]
-    return df
-
-def arabica_centlb_to_usd_per_kg(cents_per_lb: float) -> float:
-    return (cents_per_lb/100.0) / 0.45359237
-
-def robusta_usd_per_tonne_to_usd_per_kg(usd_per_tonne: float) -> float:
-    return usd_per_tonne/1000.0
-
 @st.cache_data(ttl=600)
 def fetch_stooq_csv(symbol: str, interval: str = "d") -> pd.DataFrame:
     # более дружелюбный User-Agent и два домена
@@ -243,24 +201,28 @@ def export_pdf(b, calc_params):
 
 # ---------- Sidebar: market ----------
 with st.sidebar:
-    st.subheader("Рынок (бесплатные квоты) — Stooq")
+    st.subheader("Рынок (бесплатные квоты) — Stooq/Yahoo")
     data = get_live_prices()
     kc = data.get("KC.F", {})
     rm = data.get("RM.F", {})
+
     colA, colB = st.columns(2)
+
     with colA:
         if "error" in kc:
-            st.error("Arabica KC.F: " + kc["error"])
+            st.error(kc["error"])
         else:
-            st.metric("Arabica KC.F", f"{kc['last_raw']:.2f} ¢/lb")
-            st.caption(f"≈ {kc['usdkg']:.3f} $/кг")
+            st.metric("Arabica (KC)", f"{kc['last_raw']:.2f} {kc.get('unit','')}")
+            st.caption(f"≈ {kc['usdkg']:.3f} $/кг • Source: {kc.get('source','?')}")
+
     with colB:
         if "error" in rm:
-            st.error("Robusta RM.F: " + rm["error"])
+            st.error(rm["error"])
         else:
-            st.metric("Robusta RM.F", f"{rm['last_raw']:.2f} $/т")
-            st.caption(f"≈ {rm['usdkg']:.3f} $/кг")
-    st.caption("Квоты c задержкой. Для сделок сверяйте с брокером/биржей.")
+            st.metric("Robusta (RM)", f"{rm['last_raw']:.2f} {rm.get('unit','')}")
+            st.caption(f"≈ {rm['usdkg']:.3f} $/кг • Source: {rm.get('source','?')}")
+
+    st.caption("Квоты с задержкой. Для сделок сверяйте с брокером/биржей.")
 
 # ---------- Stage A & B Starters ----------
 st.header("Калькулятор")
