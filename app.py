@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests, io, json
-import re  # ДОБАВИТЬ
+import re
 from datetime import datetime, timezone
 from io import BytesIO
 
@@ -37,10 +37,8 @@ def fetch_stooq_csv(symbol: str, interval: str = "d") -> pd.DataFrame:
                 return df.dropna()
     raise RuntimeError("Stooq CSV not available")
 
-def def fetch_yahoo_intraday_last(symbol: str, interval: str = "15m", range_: str = "1d"):
-    """
-    Возвращает (last_price, last_timestamp_utc) из интрадей-данных Yahoo.
-    """
+def fetch_yahoo_intraday_last(symbol: str, interval: str = "15m", range_: str = "1d"):
+    """Последняя непустая 15-мин свеча с Yahoo + её timestamp (UTC)."""
     headers = {"User-Agent": "Mozilla/5.0"}
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"range": range_, "interval": interval}
@@ -50,17 +48,14 @@ def def fetch_yahoo_intraday_last(symbol: str, interval: str = "15m", range_: st
 
     closes = j["indicators"]["quote"][0]["close"] or []
     ts = j.get("timestamp") or []
-    last = None
-    last_ts = None
+    last = None; last_ts = None
     for i in range(len(closes) - 1, -1, -1):
         if closes[i] is not None:
-            last = float(closes[i])
-            last_ts = ts[i] if i < len(ts) else None
+            last = float(closes[i]); last_ts = ts[i] if i < len(ts) else None
             break
     if last is None:
         last = float(j["meta"]["regularMarketPrice"])
         last_ts = j["meta"].get("currentTradingPeriod", {}).get("regular", {}).get("end", None)
-
     return last, last_ts
     
 def stooq_front_series_symbol(base_symbol: str = "rm.f") -> str | None:
@@ -188,26 +183,6 @@ with st.sidebar:
             st.caption(f"≈ {rm['usdkg']:.3f} $/кг • {rm.get('source','?')} • as of {fmt_ts(rm.get('asof'))}")
 
     st.caption("Квоты с задержкой. Для сделок сверяйте с брокером/биржей.")
-    
-with st.sidebar:
-    st.subheader("Рынок (бесплатные квоты) — Stooq/Yahoo")
-    data = get_live_prices()
-    kc = data.get("KC.F", {})
-    rm = data.get("RM.F", {})
-    colA, colB = st.columns(2)
-    with colA:
-        if "error" in kc:
-            st.error(kc["error"])
-        else:
-            st.metric("Arabica (KC)", f"{kc['last_raw']:.2f} {kc.get('unit','')}")
-            st.caption(f"≈ {kc['usdkg']:.3f} $/кг • Source: {kc.get('source','?')}")
-    with colB:
-        if "error" in rm:
-            st.error(rm["error"])
-        else:
-            st.metric("Robusta (RM)", f"{rm['last_raw']:.2f} {rm.get('unit','')}")
-            st.caption(f"≈ {rm['usdkg']:.3f} $/кг • Source: {rm.get('source','?')}")
-    st.caption("Квоты с задержкой. Для сделок сверяйте с брокером/биржей.")
 
 # ---------- Stage A & B Starters ----------
 st.header("Калькулятор")
@@ -218,8 +193,7 @@ col1, col2, col3 = st.columns(3)
 with col1:
     instrument = st.selectbox("Инструмент", ["Arabica (KC.F)", "Robusta (RM.F)"])
 with col2:
-    # base price $/kg from market or manual
-    if src == "Онлайн фьючерс (Stooq)":
+    if src == "Онлайн фьючерс (Stooq/Yahoo)":
         market_usdkg = (data.get("KC.F", {}).get("usdkg") if instrument.startswith("Arabica")
                         else data.get("RM.F", {}).get("usdkg"))
         if market_usdkg is None:
