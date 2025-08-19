@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests, io, json
+import re  # ДОБАВИТЬ
 from datetime import datetime, timezone
 from io import BytesIO
 
@@ -36,26 +37,49 @@ def fetch_stooq_csv(symbol: str, interval: str = "d") -> pd.DataFrame:
                 return df.dropna()
     raise RuntimeError("Stooq CSV not available")
 
-def fetch_yahoo_last(symbol: str) -> float:
-    """Последняя цена с Yahoo Finance (chart API). Примеры: KC=F, RM=F."""
+def def fetch_yahoo_intraday_last(symbol: str, interval: str = "15m", range_: str = "1d"):
+    """
+    Возвращает (last_price, last_timestamp_utc) из интрадей-данных Yahoo.
+    """
     headers = {"User-Agent": "Mozilla/5.0"}
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"range": "5d", "interval": "1d"}
+    params = {"range": range_, "interval": interval}
     r = requests.get(url, headers=headers, params=params, timeout=10)
     r.raise_for_status()
-    j = r.json()
-    res = j["chart"]["result"][0]
-    price = res["meta"].get("regularMarketPrice")
-    if price is None:
-        closes = res["indicators"]["quote"][0]["close"]
-        price = [x for x in closes if x is not None][-1]
-    return float(price)
+    j = r.json()["chart"]["result"][0]
 
-@st.cache_data(ttl=600)
-def get_live_prices():
+    closes = j["indicators"]["quote"][0]["close"] or []
+    ts = j.get("timestamp") or []
+    last = None
+    last_ts = None
+    for i in range(len(closes) - 1, -1, -1):
+        if closes[i] is not None:
+            last = float(closes[i])
+            last_ts = ts[i] if i < len(ts) else None
+            break
+    if last is None:
+        last = float(j["meta"]["regularMarketPrice"])
+        last_ts = j["meta"].get("currentTradingPeriod", {}).get("regular", {}).get("end", None)
+
+    return last, last_ts
+    
+def stooq_front_series_symbol(base_symbol: str = "rm.f") -> str | None:
+    """
+    Открываем страницу серий Stooq и вытаскиваем код активной серии, напр. RMU25.F
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+    url = f"https://stooq.com/q/f/?s={base_symbol}"
+    r = requests.get(url, headers=headers, timeout=10)
+    if not r.ok or not r.text:
+        return None
+    m = re.search(r"RM[A-Z]\d{2}\.F", r.text, re.IGNORECASE)
+    return m.group(0).upper() if m else None
+
+@st.cache_data(ttl=900)  # 15 минут
+def get_live_prices(seed: int = 0):
     data = {}
 
-    # Arabica (¢/lb)
+    # ----- Arabica (¢/lb) -----
     try:
         kc = fetch_stooq_csv("kc.f")
         last_kc = float(kc.iloc[-1]["close"])
@@ -64,21 +88,24 @@ def get_live_prices():
             "unit": "¢/lb",
             "usdkg": arabica_centlb_to_usd_per_kg(last_kc),
             "source": "Stooq",
+            "asof": None,
         }
     except Exception:
         try:
-            last_kc = fetch_yahoo_last("KC=F")
+            last_kc, last_ts = fetch_yahoo_intraday_last("KC=F", interval="15m", range_="1d")
             data["KC.F"] = {
                 "last_raw": last_kc,
                 "unit": "¢/lb",
                 "usdkg": arabica_centlb_to_usd_per_kg(last_kc),
-                "source": "Yahoo",
+                "source": "Yahoo 15m",
+                "asof": last_ts,
             }
         except Exception as e:
             data["KC.F"] = {"error": f"Arabica: {e}"}
 
-    # Robusta (USD/tonne) — каскад: Stooq → Yahoo RC=F → Yahoo RM=F
+    # ----- Robusta (USD/tonne) -----
     try:
+        # Stooq непрерывный символ
         rm = fetch_stooq_csv("rm.f")
         last_rm = float(rm.iloc[-1]["close"])
         data["RM.F"] = {
@@ -86,33 +113,82 @@ def get_live_prices():
             "unit": "USD/t",
             "usdkg": robusta_usd_per_tonne_to_usd_per_kg(last_rm),
             "source": "Stooq",
+            "asof": None,
         }
     except Exception:
-        last_rm = None
-        last_err = None
-        yahoo_sym = None
-        for ysym in ("RC=F", "RM=F"):
-            try:
-                y = fetch_yahoo_last(ysym)  # обе серии отдают USD/tonne
-                last_rm = float(y)
-                yahoo_sym = ysym
-                break
-            except Exception as e:
-                last_err = e
-        if last_rm is not None:
-            data["RM.F"] = {
-                "last_raw": last_rm,
-                "unit": "USD/t",
-                "usdkg": robusta_usd_per_tonne_to_usd_per_kg(last_rm),
-                "source": f"Yahoo ({yahoo_sym})",
-            }
-        else:
-            data["RM.F"] = {"error": f"Robusta: {last_err}"}
+        # Stooq front-month серия (напр., RMU25.F)
+        try:
+            front = stooq_front_series_symbol("rm.f")
+            if front:
+                rm_series = fetch_stooq_csv(front)
+                last_rm = float(rm_series.iloc[-1]["close"])
+                data["RM.F"] = {
+                    "last_raw": last_rm,
+                    "unit": "USD/t",
+                    "usdkg": robusta_usd_per_tonne_to_usd_per_kg(last_rm),
+                    "source": f"Stooq ({front})",
+                    "asof": None,
+                }
+            else:
+                raise RuntimeError("No Stooq front month found")
+        except Exception:
+            # Yahoo intraday (тикер может быть RC=F или RM=F)
+            last_rm = None
+            last_ts = None
+            yahoo_sym = None
+            last_err = None
+            for ysym in ("RC=F", "RM=F"):
+                try:
+                    yprice, yts = fetch_yahoo_intraday_last(ysym, interval="15m", range_="1d")
+                    last_rm, last_ts, yahoo_sym = float(yprice), yts, ysym
+                    break
+                except Exception as e:
+                    last_err = e
+            if last_rm is not None:
+                data["RM.F"] = {
+                    "last_raw": last_rm,
+                    "unit": "USD/t",
+                    "usdkg": robusta_usd_per_tonne_to_usd_per_kg(last_rm),
+                    "source": f"Yahoo 15m ({yahoo_sym})",
+                    "asof": last_ts,
+                }
+            else:
+                data["RM.F"] = {"error": f"Robusta: {last_err}"}
 
     data["ts"] = datetime.now(timezone.utc).isoformat()
     return data
 
 # ---------- Sidebar: market (ОДИН раз) ----------
+def fmt_ts(ts):
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M UTC") if ts else "n/a"
+
+with st.sidebar:
+    if "refresh_seed" not in st.session_state:
+        st.session_state["refresh_seed"] = 0
+    if st.button("↻ Обновить котировки"):
+        st.session_state["refresh_seed"] += 1
+
+    st.subheader("Рынок (бесплатные квоты) — Stooq/Yahoo")
+    data = get_live_prices(st.session_state["refresh_seed"])
+    kc = data.get("KC.F", {})
+    rm = data.get("RM.F", {})
+
+    colA, colB = st.columns(2)
+    with colA:
+        if "error" in kc:
+            st.error(kc["error"])
+        else:
+            st.metric("Arabica (KC)", f"{kc['last_raw']:.2f} {kc.get('unit','')}")
+            st.caption(f"≈ {kc['usdkg']:.3f} $/кг • {kc.get('source','?')} • as of {fmt_ts(kc.get('asof'))}")
+    with colB:
+        if "error" in rm:
+            st.error(rm["error"])
+        else:
+            st.metric("Robusta (RM)", f"{rm['last_raw']:.2f} {rm.get('unit','')}")
+            st.caption(f"≈ {rm['usdkg']:.3f} $/кг • {rm.get('source','?')} • as of {fmt_ts(rm.get('asof'))}")
+
+    st.caption("Квоты с задержкой. Для сделок сверяйте с брокером/биржей.")
+    
 with st.sidebar:
     st.subheader("Рынок (бесплатные квоты) — Stooq/Yahoo")
     data = get_live_prices()
@@ -136,7 +212,7 @@ with st.sidebar:
 # ---------- Stage A & B Starters ----------
 st.header("Калькулятор")
 
-src = st.radio("Источник цены", ["Онлайн фьючерс (Stooq)", "Введу вручную"], horizontal=True)
+src = st.radio("Источник цены", ["Онлайн фьючерс (Stooq/Yahoo)", "Введу вручную"], horizontal=True)
 
 col1, col2, col3 = st.columns(3)
 with col1:
