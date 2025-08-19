@@ -11,18 +11,30 @@ from io import BytesIO
 
 st.set_page_config(page_title="Coffee Landed Cost — MVP", page_icon="☕", layout="wide")
 st.title("☕ Coffee Landed Cost — MVP")
-st.caption(with colA:
-    if "error" in kc:
-        st.error(kc["error"])
-    else:
-        st.metric("Arabica (KC)", f"{kc['last_raw']:.2f} {kc.get('unit','')}")
-        st.caption(f"≈ {kc['usdkg']:.3f} $/кг • Source: {kc.get('source','?')}")
-with colB:
-    if "error" in rm:
-        st.error(rm["error"])
-    else:
-        st.metric("Robusta (RM)", f"{rm['last_raw']:.2f} {rm.get('unit','')}")
-        st.caption(f"≈ {rm['usdkg']:.3f} $/кг • Source: {rm.get('source','?')}"))
+# ---------- Sidebar: market ----------
+with st.sidebar:
+    st.subheader("Рынок (бесплатные квоты) — Stooq/Yahoo")
+    data = get_live_prices()
+    kc = data.get("KC.F", {})
+    rm = data.get("RM.F", {})
+
+    colA, colB = st.columns(2)
+
+    with colA:
+        if "error" in kc:
+            st.error(kc["error"])
+        else:
+            st.metric("Arabica (KC)", f"{kc['last_raw']:.2f} {kc.get('unit','')}")
+            st.caption(f"≈ {kc['usdkg']:.3f} $/кг • Source: {kc.get('source','?')}")
+
+    with colB:
+        if "error" in rm:
+            st.error(rm["error"])
+        else:
+            st.metric("Robusta (RM)", f"{rm['last_raw']:.2f} {rm.get('unit','')}")
+            st.caption(f"≈ {rm['usdkg']:.3f} $/кг • Source: {rm.get('source','?')}")
+
+    st.caption("Квоты с задержкой. Для сделок сверяйте с брокером/биржей.")
 
 # ---------- Helpers ----------
 @st.cache_data(ttl=600)
