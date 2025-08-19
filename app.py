@@ -1,15 +1,15 @@
 import os, re, io, json
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, Tuple
 from datetime import datetime, timezone
+from typing import Optional, Tuple, List
 
 import requests
 import pandas as pd
 import numpy as np
 import streamlit as st
 
-# ---- PDF (мягко) -----------------------------------------------------------
+# ---- PDF (опционально) ----------------------------------------------------
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
@@ -18,22 +18,18 @@ try:
 except Exception:
     REPORTLAB_OK = False
 
-# ---- Page ------------------------------------------------------------------
+# ---- Page -----------------------------------------------------------------
 st.set_page_config(page_title="Coffee Landed Cost — MVP", page_icon="☕", layout="wide")
 st.title("☕ Coffee Landed Cost — MVP")
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 
-# ---- Secrets / API keys ----------------------------------------------------
-ALPHA_KEY = st.secrets.get("ALPHAVANTAGE_API_KEY", os.getenv("ALPHAVANTAGE_API_KEY"))
-
-# ---- Small utils -----------------------------------------------------------
+# ---- Helpers ---------------------------------------------------------------
 def fmt_ts(ts: Optional[int]) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M UTC") if ts else "n/a"
 
 def load_json(filename: str, default: dict) -> dict:
-    """Безопасное чтение JSON из data/ с дефолтом."""
     p = DATA_DIR / filename
     try:
         with open(p, "r", encoding="utf-8") as f:
@@ -43,16 +39,15 @@ def load_json(filename: str, default: dict) -> dict:
 
 # ---- Conversions -----------------------------------------------------------
 def arabica_centlb_to_usd_per_kg(cents_per_lb: float) -> float:
-    # 1 lb = 0.45359237 kg; price in ¢/lb => $/kg
-    return (cents_per_lb / 100.0) / 0.45359237
+    return (float(cents_per_lb) / 100.0) / 0.45359237
 
 def robusta_usd_per_tonne_to_usd_per_kg(usd_per_tonne: float) -> float:
-    return usd_per_tonne / 1000.0
+    return float(usd_per_tonne) / 1000.0
 
-# ---- Market fetchers -------------------------------------------------------
+# ---- Stooq fetcher ---------------------------------------------------------
 @st.cache_data(ttl=600)
 def fetch_stooq_csv(symbol: str, interval: str = "d") -> pd.DataFrame:
-    """CSV со Stooq (два домена, UA). Поддерживает kc.f / rm.f / RMU25.F и т.п."""
+    """CSV из Stooq (kc.f / rm.f / RMU25.F)."""
     headers = {"User-Agent": "Mozilla/5.0"}
     for base in ("https://stooq.com", "https://stooq.pl"):
         url = f"{base}/q/d/l/?s={symbol}&i={interval}"
@@ -66,7 +61,7 @@ def fetch_stooq_csv(symbol: str, interval: str = "d") -> pd.DataFrame:
     raise RuntimeError(f"Stooq CSV not available for {symbol}")
 
 def stooq_front_series_symbol(base_symbol: str = "rm.f") -> Optional[str]:
-    """Пытаемся обнаружить актуальную серию робусты на странице Stooq (например RMU25.F)."""
+    """Находим актуальную серию робусты (например, RMU25.F)."""
     headers = {"User-Agent": "Mozilla/5.0"}
     url = f"https://stooq.com/q/f/?s={base_symbol}"
     r = requests.get(url, headers=headers, timeout=10)
@@ -75,6 +70,7 @@ def stooq_front_series_symbol(base_symbol: str = "rm.f") -> Optional[str]:
     m = re.search(r"RM[A-Z]\d{2}\.F", r.text, re.IGNORECASE)
     return m.group(0).upper() if m else None
 
+# ---- Yahoo fetchers --------------------------------------------------------
 def fetch_yahoo_intraday_last(symbol: str, interval: str = "1m", range_: str = "1d") -> Tuple[float, Optional[int]]:
     """Последняя непустая свеча Yahoo (интрадей). Возвращает (price, unix_ts_utc)."""
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -92,78 +88,82 @@ def fetch_yahoo_intraday_last(symbol: str, interval: str = "1m", range_: str = "
             break
     if last is None:
         last = float(j["meta"]["regularMarketPrice"])
-        last_ts = j["meta"].get("currentTradingPeriod", {}).get("regular", {}).get("end", None)
+        last_ts = j["meta"].get("regularMarketTime")
     return last, last_ts
 
-@st.cache_data(ttl=3600)
-def fetch_alpha_coffee_monthly(api_key: str, interval: str = "monthly") -> Tuple[float, str]:
-    """
-    Alpha Vantage: Global price of Coffee (IMF, Other Mild Arabica), ежемесячно.
-    Возвращает (usd_per_kg, iso_date).
-    """
-    if not api_key:
-        raise RuntimeError("Alpha Vantage API key is missing")
-    url = "https://www.alphavantage.co/query"
-    params = {"function": "COFFEE", "interval": interval, "apikey": api_key}
-    r = requests.get(url, params=params, timeout=15)
+@st.cache_data(ttl=60)
+def yahoo_quote_multi(symbols: List[str]) -> dict:
+    """Yahoo quote v7 (не HTML-страница). Возвращает {symbol: {price, ts}}."""
+    if not symbols:
+        return {}
+    headers = {"User-Agent": "Mozilla/5.0"}
+    url = "https://query1.finance.yahoo.com/v7/finance/quote"
+    params = {"symbols": ",".join(symbols)}
+    r = requests.get(url, headers=headers, params=params, timeout=10)
     r.raise_for_status()
-    j = r.json()
-    data = j.get("data") or []
-    if not data:
-        raise RuntimeError(j.get("note") or "Alpha Vantage: empty data")
-    rec = max(data, key=lambda x: x.get("date", ""))
-    usd_per_kg = float(rec["value"])
-    return usd_per_kg, rec["date"]
+    res = r.json()["quoteResponse"]["result"]
+    out = {}
+    for row in res:
+        sym = row.get("symbol")
+        price = row.get("regularMarketPrice")
+        ts = row.get("regularMarketTime")
+        if sym and price is not None:
+            out[sym] = {"price": float(price), "ts": int(ts) if ts else None}
+    return out
 
-@st.cache_data(ttl=900)  # 15 минут
-def get_live_prices(seed: int = 0,
-                    kc_yahoo: str = "KC=F",
-                    rm_yahoo_candidates: Tuple[str, ...] = ("RC=F", "RM=F"),
-                    prefer_alpha_for_arabica: bool = False) -> dict:
-    """
-    Возвращает словарь:
-      KC.F: {last_raw (¢/lb), usdkg, unit, source, asof}
-      RM.F: {last_raw (USD/t), usdkg, unit, source, asof}
-    """
+# ---- KC futures board (Arabica) -------------------------------------------
+MONTHS = [(3, "H"), (5, "K"), (7, "N"), (9, "U"), (12, "Z")]  # Mar/May/Jul/Sep/Dec
+
+def next_kc_contracts(n: int = 8, now: Optional[datetime] = None) -> List[dict]:
+    """Список ближайших KC контрактов: [{'contract':'KCU25','yahoo':'KCU25=F'}, ...]"""
+    now = now or datetime.now(timezone.utc)
+    y, m = now.year, now.month
+    # стартовый индекс в цикле
+    start_idx = None
+    for i, (mm, _) in enumerate(MONTHS):
+        if m <= mm:
+            start_idx = i; break
+    if start_idx is None:
+        start_idx = 0
+        y += 1
+    out = []
+    year = y
+    idx = start_idx
+    for _ in range(n):
+        mm, code = MONTHS[idx]
+        contract = f"KC{code}{year % 100:02d}"
+        out.append({"contract": contract, "yahoo": f"{contract}=F"})
+        idx += 1
+        if idx >= len(MONTHS):
+            idx = 0
+            year += 1
+    return out
+
+@st.cache_data(ttl=60)
+def get_kc_futures_board(n: int = 8, seed: int = 0) -> List[dict]:
+    """Доска KC: [{'contract','yahoo','price_cents_lb','usdkg','asof','is_front'}]."""
+    rows = next_kc_contracts(n=n)
+    quotes = yahoo_quote_multi([r["yahoo"] for r in rows])
+    out = []
+    for i, r in enumerate(rows):
+        q = quotes.get(r["yahoo"], {})
+        price = q.get("price")  # ¢/lb
+        asof = q.get("ts")
+        out.append({
+            "contract": r["contract"],
+            "yahoo": r["yahoo"],
+            "price_cents_lb": price,
+            "usdkg": arabica_centlb_to_usd_per_kg(price) if price is not None else None,
+            "asof": asof,
+            "is_front": i == 0,  # самый ближайший
+        })
+    return out
+
+# ---- Robusta cascade (Stooq -> Stooq(front) -> Yahoo 1m) ------------------
+@st.cache_data(ttl=900)
+def get_robusta_prices(seed: int = 0,
+                       rm_yahoo_candidates: Tuple[str, ...] = ("RC=F", "RM=F")) -> dict:
     data = {}
-
-    # ---- Arabica (¢/lb) ----
-    def pack_arabica_from_usdkg(usdkg: float, source: str, asof=None):
-        cents_per_lb = usdkg * 0.45359237 * 100.0
-        return {"last_raw": cents_per_lb, "unit": "¢/lb", "usdkg": float(usdkg),
-                "source": source, "asof": asof}
-
-    if prefer_alpha_for_arabica and ALPHA_KEY:
-        try:
-            usdkg, d = fetch_alpha_coffee_monthly(ALPHA_KEY, "monthly")
-            data["KC.F"] = pack_arabica_from_usdkg(usdkg, "AlphaVantage (IMF monthly)", d)
-        except Exception:
-            pass
-
-    if "KC.F" not in data:
-        try:
-            kc = fetch_stooq_csv("kc.f")
-            last_kc = float(kc.iloc[-1]["close"])  # ¢/lb
-            data["KC.F"] = {"last_raw": last_kc, "unit": "¢/lb",
-                            "usdkg": arabica_centlb_to_usd_per_kg(last_kc),
-                            "source": "Stooq", "asof": None}
-        except Exception:
-            try:
-                last_kc, last_ts = fetch_yahoo_intraday_last(kc_yahoo, "1m", "1d")
-                data["KC.F"] = {"last_raw": last_kc, "unit": "¢/lb",
-                                "usdkg": arabica_centlb_to_usd_per_kg(last_kc),
-                                "source": f"Yahoo 1m ({kc_yahoo})", "asof": last_ts}
-            except Exception:
-                if ALPHA_KEY:
-                    try:
-                        usdkg, d = fetch_alpha_coffee_monthly(ALPHA_KEY, "monthly")
-                        data["KC.F"] = pack_arabica_from_usdkg(usdkg, "AlphaVantage (IMF monthly)", d)
-                    except Exception as e:
-                        data["KC.F"] = {"error": f"Arabica: {e}"}
-                else:
-                    data["KC.F"] = {"error": "Arabica: no free sources responded"}
-
-    # ---- Robusta (USD/tonne) ----
     try:
         rm = fetch_stooq_csv("rm.f")
         last_rm = float(rm.iloc[-1]["close"])
@@ -196,19 +196,15 @@ def get_live_prices(seed: int = 0,
                                 "source": f"Yahoo 1m ({picked})", "asof": last_ts}
             else:
                 data["RM.F"] = {"error": f"Robusta: {last_err}"}
-
     data["ts"] = datetime.now(timezone.utc).isoformat()
     return data
 
 # ---- Core calc -------------------------------------------------------------
 def compute_customs_value(incoterm: str, goods_value: float, freight: float, insurance: float) -> float:
     inc = incoterm.upper()
-    if inc in {"FOB", "EXW"}:
-        return goods_value + freight + insurance
-    if inc == "CFR":
-        return goods_value + insurance
-    # CIF: уже включает фрахт+страховку
-    return goods_value
+    if inc in {"FOB", "EXW"}: return goods_value + freight + insurance
+    if inc == "CFR":          return goods_value + insurance
+    return goods_value  # CIF: уже включает фрахт+страховку
 
 def compute_quote(usd_per_kg, weight_kg, incoterm, freight, insurance,
                   duty_rate, duty_sp_perkg, vat_rate, fees):
@@ -219,8 +215,7 @@ def compute_quote(usd_per_kg, weight_kg, incoterm, freight, insurance,
     duty_total = duty_ad + duty_sp
 
     def fee_amt(f):
-        if f["kind"] == "fixed":
-            return float(f.get("amount", 0))
+        if f["kind"] == "fixed": return float(f.get("amount", 0))
         base = f.get("base", "CV")
         base_val = cv if base == "CV" else goods_value if base == "Goods" else cv + duty_total
         return float(f.get("rate", 0)) * base_val
@@ -264,8 +259,7 @@ def export_excel(b, calc_params):
     buf.seek(0); return buf
 
 def export_pdf(b, calc_params):
-    if not REPORTLAB_OK:
-        return None
+    if not REPORTLAB_OK: return None
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     w, h = A4; y = h - 2*cm
@@ -287,63 +281,83 @@ def export_pdf(b, calc_params):
 
 # ---- Sidebar ---------------------------------------------------------------
 with st.sidebar:
-    st.subheader("Источник котировок")
-    kc_yahoo = st.text_input("Arabica — Yahoo symbol", value="KC=F",
-                             help="Непрерывный контракт. Для месяца: KCU25=F, KCH26=F (на странице Yahoo это KCU25.NYB).")
-    rm_main = st.text_input("Robusta — Yahoo symbol (1)", value="RC=F")
-    rm_alt  = st.text_input("Robusta — Yahoo symbol (2, запасной)", value="RM=F")
-    prefer_alpha = st.checkbox("Arabica: предпочитать Alpha Vantage (IMF monthly)", value=False)
-    st.caption("Yahoo отдаёт интрадей (1m) с задержкой; Alpha — ежемесячный индекс IMF.")
-
-    st.divider()
+    st.subheader("Arabica — контракты (Yahoo futures)")
     if "refresh_seed" not in st.session_state: st.session_state["refresh_seed"] = 0
     if st.button("↻ Обновить котировки"): st.session_state["refresh_seed"] += 1
 
-    data = get_live_prices(
-        st.session_state["refresh_seed"],
-        kc_yahoo=kc_yahoo.strip() or "KC=F",
-        rm_yahoo_candidates=tuple(s for s in [rm_main.strip(), rm_alt.strip()] if s),
-        prefer_alpha_for_arabica=prefer_alpha
-    )
-    kc = data.get("KC.F", {}); rm = data.get("RM.F", {})
+    board = get_kc_futures_board(n=8, seed=st.session_state["refresh_seed"])
+    if not board or board[0]["price_cents_lb"] is None:
+        st.error("Не удалось получить котировки KC с Yahoo.")
+        kc_selected_row = None
+    else:
+        options = [row["contract"] for row in board]
+        default_idx = 0  # front-month
+        sel = st.selectbox("Выберите контракт", options, index=default_idx, key="kc_pick")
+        kc_selected_row = next(r for r in board if r["contract"] == sel)
+
+        st.metric("Текущий контракт (front)", board[0]["contract"])
+        st.caption(
+            f"{board[0]['contract']} • {board[0]['price_cents_lb']:.2f} ¢/lb • "
+            f"≈ {board[0]['usdkg']:.3f} $/кг • as of {fmt_ts(board[0]['asof'])}"
+        )
+
+    st.divider()
+    st.subheader("Robusta — котировки")
+    rm_main = st.text_input("Yahoo symbol (1)", value="RC=F")
+    rm_alt  = st.text_input("Yahoo symbol (2, запасной)", value="RM=F")
+    robusta_data = get_robusta_prices(st.session_state["refresh_seed"],
+                                      rm_yahoo_candidates=tuple(s for s in [rm_main.strip(), rm_alt.strip()] if s))
+    rm = robusta_data.get("RM.F", {})
 
     colA, colB = st.columns(2)
     with colA:
-        if "error" in kc:
-            st.error(kc["error"])
+        # Arabica (по выбранному контракту)
+        if kc_selected_row and kc_selected_row["usdkg"] is not None:
+            st.metric("Arabica (KC)", f"{kc_selected_row['price_cents_lb']:.2f} ¢/lb")
+            st.caption(f"≈ {kc_selected_row['usdkg']:.3f} $/кг • Yahoo ({kc_selected_row['yahoo']}) • as of {fmt_ts(kc_selected_row['asof'])}")
         else:
-            st.metric("Arabica (KC)", f"{kc['last_raw']:.2f} {kc.get('unit','')}")
-            st.caption(f"≈ {kc['usdkg']:.3f} $/кг • {kc.get('source','?')} • as of {fmt_ts(kc.get('asof'))}")
+            st.error("Arabica: нет цены.")
     with colB:
+        # Robusta
         if "error" in rm:
             st.error(rm["error"])
         else:
-            st.metric("Robusta (RM)", f"{rm['last_raw']:.2f} {rm.get('unit','')}")
-            st.caption(f"≈ {rm['usdkg']:.3f} $/кг • {rm.get('source','?')} • as of {fmt_ts(rm.get('asof'))}")
+            st.metric("Robusta (RM)", f"{rm.get('last_raw', 0):.2f} {rm.get('unit','')}")
+            st.caption(f"≈ {rm.get('usdkg',0):.3f} $/кг • {rm.get('source','?')} • as of {fmt_ts(rm.get('asof'))}")
+
     st.caption("Котировки ознакомительные. Для сделок сверяйте с брокером/биржей.")
 
 # ---- Main form -------------------------------------------------------------
 st.header("Калькулятор")
 
-src = st.radio("Источник цены", ["Онлайн фьючерс (Stooq/Yahoo)", "Введу вручную"], horizontal=True)
+src = st.radio("Источник цены", ["Онлайн фьючерс (Yahoo, контракт KC)", "Введу вручную"], horizontal=True)
 
 col1, col2, col3 = st.columns(3)
 with col1:
     instrument = st.selectbox("Инструмент", ["Arabica (KC.F)", "Robusta (RM.F)"])
 with col2:
-    if src == "Онлайн фьючерс (Stooq/Yahoo)":
-        market_usdkg = (data.get("KC.F", {}).get("usdkg") if instrument.startswith("Arabica")
-                        else data.get("RM.F", {}).get("usdkg"))
-        if market_usdkg is None:
-            st.warning("Нет данных рынка — переключитесь на ввод вручную.")
-            base_usdkg = st.number_input("Базовая цена $/кг", min_value=0.0, value=3.000, step=0.001)
+    if src == "Онлайн фьючерс (Yahoo, контракт KC)":
+        if instrument.startswith("Arabica"):
+            if kc_selected_row and kc_selected_row["usdkg"] is not None:
+                st.text_input("Базовая цена $/кг (из выбранного контракта)",
+                              value=f"{kc_selected_row['usdkg']:.4f}", disabled=True)
+                base_usdkg = float(kc_selected_row["usdkg"])
+            else:
+                st.warning("Нет данных по выбранному контракту — введите вручную.")
+                base_usdkg = st.number_input("Базовая цена $/кг", min_value=0.0, value=3.000, step=0.001)
         else:
-            st.text_input("Базовая цена $/кг (из рынка)", value=f"{market_usdkg:.4f}", disabled=True)
-            base_usdkg = float(market_usdkg)
+            market_usdkg = rm.get("usdkg")
+            if market_usdkg is None:
+                st.warning("Нет данных Robusta — введите вручную.")
+                base_usdkg = st.number_input("Базовая цена $/кг", min_value=0.0, value=3.000, step=0.001)
+            else:
+                st.text_input("Базовая цена $/кг (из рынка)", value=f"{market_usdkg:.4f}", disabled=True)
+                base_usdkg = float(market_usdkg)
     else:
         base_usdkg = st.number_input("Базовая цена $/кг", min_value=0.0, value=3.000, step=0.001)
 with col3:
     diff = st.number_input("Дифференциал $/кг (±)", value=0.000, step=0.010, help="Добавка/скидка к базовой цене")
+
 effective_usdkg = base_usdkg + diff
 st.caption(f"Эффективная цена: **{effective_usdkg:.4f} $/кг**")
 
@@ -364,11 +378,9 @@ with colw3:
 
 # Jurisdiction presets
 st.markdown("**Юрисдикция (НДС/пошлина пресет)**")
-jur_defaults = {
-    "EAEU - Belarus": {"vat_rate": 0.20, "duty_rate": 0.00},
-    "EAEU - Russia": {"vat_rate": 0.20, "duty_rate": 0.00},
-    "UAE": {"vat_rate": 0.05, "duty_rate": 0.00},
-}
+jur_defaults = {"EAEU - Belarus": {"vat_rate": 0.20, "duty_rate": 0.00},
+                "EAEU - Russia":  {"vat_rate": 0.20, "duty_rate": 0.00},
+                "UAE":            {"vat_rate": 0.05, "duty_rate": 0.00}}
 jur_data = load_json("jurisdictions.json", jur_defaults)
 colsj1, colsj2 = st.columns(2)
 with colsj1:
@@ -381,13 +393,11 @@ duty_rate = st.number_input("Пошлина (адвал., 0..1)", min_value=0.0,
                             value=float(j.get("duty_rate", 0.0)), step=0.01)
 duty_sp_perkg = st.number_input("Пошлина (специф., $/кг)", min_value=0.0, value=0.0, step=0.01)
 
-# Route presets (for CFR/CIF)
+# Route presets (для CFR/CIF)
 st.markdown("**Маршрут (для CFR/CIF пресеты фрахта/страховки)**")
-routes_defaults = {
-    "Santos → Riga": {"incoterms": ["CFR", "CIF"], "freight": 1800, "insurance": 80},
-    "Santos → Dubai": {"incoterms": ["CFR", "CIF"], "freight": 1600, "insurance": 70},
-    "Jebel Ali → Riyadh": {"incoterms": ["CFR", "CIF"], "freight": 600, "insurance": 40},
-}
+routes_defaults = {"Santos → Riga": {"incoterms": ["CFR", "CIF"], "freight": 1800, "insurance": 80},
+                   "Santos → Dubai": {"incoterms": ["CFR", "CIF"], "freight": 1600, "insurance": 70},
+                   "Jebel Ali → Riyadh": {"incoterms": ["CFR", "CIF"], "freight": 600, "insurance": 40}}
 routes = load_json("routes.json", routes_defaults)
 route_names = ["(не использ.)"] + list(routes.keys())
 colr1, colr2, colr3 = st.columns(3)
@@ -473,16 +483,5 @@ if st.button("Рассчитать", type="primary"):
         st.download_button("⬇️ Скачать PDF (сводка)", data=pdf_buf, file_name="summary.pdf", mime="application/pdf")
     else:
         st.info("PDF-экспорт недоступен (ReportLab не установлен).")
-
-    st.subheader("Скопировать расчёт (текст)")
-    txt = f"""Landed cost: {b['total']:.2f} USD ({b['per_kg']:.4f} USD/kg)
-Instrument: {instrument}, Base: {base_usdkg:.4f}, Diff: {diff:+.4f}, Effective: {effective_usdkg:.4f}
-Weight: {weight_kg:,.0f} kg, Incoterm: {incoterm}, Freight: {freight:.2f}, Insurance: {insurance:.2f}
-VAT rate: {vat_rate}, Duty ad val.: {duty_rate}, Duty specific: {duty_sp_perkg}
-Jurisdiction: {jname}, Route: {rsel}
-CV: {b['customs_value']:.2f}, Duty total: {b['duty_total']:.2f}, Fees: {b['fees_total']:.2f}, VAT: {b['vat']:.2f}
-"""
-    st.text_area("Текст:", value=txt, height=160)
-    st.info("Выделите текст и нажмите ⌘+C / Ctrl+C для копирования.")
 else:
     st.info("Заполните поля и нажмите «Рассчитать».")
