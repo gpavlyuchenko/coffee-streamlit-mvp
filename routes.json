@@ -1,0 +1,26 @@
+{
+  "Santos\u2192Riga (sea)": {
+    "incoterms": [
+      "CFR",
+      "CIF"
+    ],
+    "freight": 1800.0,
+    "insurance": 80.0
+  },
+  "Santos\u2192Dubai (sea)": {
+    "incoterms": [
+      "CFR",
+      "CIF"
+    ],
+    "freight": 2100.0,
+    "insurance": 90.0
+  },
+  "Jebel Ali\u2192Riyadh (road)": {
+    "incoterms": [
+      "CFR",
+      "CIF"
+    ],
+    "freight": 1200.0,
+    "insurance": 50.0
+  }
+}
