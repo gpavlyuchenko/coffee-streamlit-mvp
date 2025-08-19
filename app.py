@@ -79,27 +79,36 @@ def get_live_prices():
 
     # Robusta (USD/tonne)
     try:
-        rm = fetch_stooq_csv("rm.f")
-        last_rm = float(rm.iloc[-1]["close"])
+    # 1) пробуем Stooq (USD/tonne)
+    rm = fetch_stooq_csv("rm.f")
+    last_rm = float(rm.iloc[-1]["close"])
+    data["RM.F"] = {
+        "last_raw": last_rm,
+        "unit": "USD/t",
+        "usdkg": robusta_usd_per_tonne_to_usd_per_kg(last_rm),
+        "source": "Stooq",
+    }
+except Exception:
+    # 2) пробуем Yahoo: сначала RC=F, затем RM=F
+    last_rm = None
+    last_err = None
+    for ysym in ["RC=F", "RM=F"]:
+        try:
+            y = fetch_yahoo_last(ysym)   # обе серии — USD/tonne
+            last_rm = float(y)
+            yahoo_sym = ysym
+            break
+        except Exception as e:
+            last_err = e
+    if last_rm is not None:
         data["RM.F"] = {
             "last_raw": last_rm,
             "unit": "USD/t",
             "usdkg": robusta_usd_per_tonne_to_usd_per_kg(last_rm),
-            "source": "Stooq",
+            "source": f"Yahoo ({yahoo_sym})",
         }
-    except Exception:
-        try:
-            last_rm = fetch_yahoo_last("RM=F")  # <-- ВАЖНО: RM=F, не RC=F
-            data["RM.F"] = {
-                "last_raw": last_rm,
-                "unit": "USD/t",
-                "usdkg": robusta_usd_per_tonne_to_usd_per_kg(last_rm),
-                "source": "Yahoo",
-            }
-        except Exception as e:
-            data["RM.F"] = {"error": f"Robusta: {e}"}
-
-    data["ts"] = datetime.now(timezone.utc).isoformat()
+    else:
+        data["RM.F"] = {"error": f"Robusta: {last_err}"}
     return data
 
 # ---------- Sidebar: market (ОДИН раз) ----------
