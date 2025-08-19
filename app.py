@@ -77,38 +77,39 @@ def get_live_prices():
         except Exception as e:
             data["KC.F"] = {"error": f"Arabica: {e}"}
 
-    # Robusta (USD/tonne)
+    # Robusta (USD/tonne) — каскад: Stooq → Yahoo RC=F → Yahoo RM=F
     try:
-    # 1) пробуем Stooq (USD/tonne)
-    rm = fetch_stooq_csv("rm.f")
-    last_rm = float(rm.iloc[-1]["close"])
-    data["RM.F"] = {
-        "last_raw": last_rm,
-        "unit": "USD/t",
-        "usdkg": robusta_usd_per_tonne_to_usd_per_kg(last_rm),
-        "source": "Stooq",
-    }
-except Exception:
-    # 2) пробуем Yahoo: сначала RC=F, затем RM=F
-    last_rm = None
-    last_err = None
-    for ysym in ["RC=F", "RM=F"]:
-        try:
-            y = fetch_yahoo_last(ysym)   # обе серии — USD/tonne
-            last_rm = float(y)
-            yahoo_sym = ysym
-            break
-        except Exception as e:
-            last_err = e
-    if last_rm is not None:
+        rm = fetch_stooq_csv("rm.f")
+        last_rm = float(rm.iloc[-1]["close"])
         data["RM.F"] = {
             "last_raw": last_rm,
             "unit": "USD/t",
             "usdkg": robusta_usd_per_tonne_to_usd_per_kg(last_rm),
-            "source": f"Yahoo ({yahoo_sym})",
+            "source": "Stooq",
         }
-    else:
-        data["RM.F"] = {"error": f"Robusta: {last_err}"}
+    except Exception:
+        last_rm = None
+        last_err = None
+        yahoo_sym = None
+        for ysym in ("RC=F", "RM=F"):
+            try:
+                y = fetch_yahoo_last(ysym)  # обе серии отдают USD/tonne
+                last_rm = float(y)
+                yahoo_sym = ysym
+                break
+            except Exception as e:
+                last_err = e
+        if last_rm is not None:
+            data["RM.F"] = {
+                "last_raw": last_rm,
+                "unit": "USD/t",
+                "usdkg": robusta_usd_per_tonne_to_usd_per_kg(last_rm),
+                "source": f"Yahoo ({yahoo_sym})",
+            }
+        else:
+            data["RM.F"] = {"error": f"Robusta: {last_err}"}
+
+    data["ts"] = datetime.now(timezone.utc).isoformat()
     return data
 
 # ---------- Sidebar: market (ОДИН раз) ----------
