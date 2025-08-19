@@ -1,27 +1,34 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests, io, json
 from datetime import datetime, timezone
+from io import BytesIO
+
+# PDF (можно оставить как есть; если когда-то будет проблема - сделаем try/except)
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import cm
-from io import BytesIO
 
 st.set_page_config(page_title="Coffee Landed Cost — MVP", page_icon="☕", layout="wide")
 st.title("☕ Coffee Landed Cost — MVP")
 
-# ---------- Helpers ----------
+# ---------- Helpers (ВСЕ функции ОБЯЗАТЕЛЬНО до сайдбара) ----------
+
+def arabica_centlb_to_usd_per_kg(cents_per_lb: float) -> float:
+    return (cents_per_lb / 100.0) / 0.45359237
+
+def robusta_usd_per_tonne_to_usd_per_kg(usd_per_tonne: float) -> float:
+    return usd_per_tonne / 1000.0
+
 @st.cache_data(ttl=600)
 def fetch_stooq_csv(symbol: str, interval: str = "d") -> pd.DataFrame:
-    # более дружелюбный User-Agent и два домена
+    """CSV с Stooq с простым user-agent и двумя доменами."""
     headers = {"User-Agent": "Mozilla/5.0"}
     for base in ["https://stooq.com", "https://stooq.pl"]:
         url = f"{base}/q/d/l/?s={symbol}&i={interval}"
         r = requests.get(url, headers=headers, timeout=10)
         if r.ok and r.text.strip():
-            # иногда Stooq возвращает HTML/сообщение — проверяем, что первая строка про колонки CSV
             first_line = r.text.splitlines()[0].lower()
             if "date" in first_line and "close" in first_line:
                 df = pd.read_csv(io.StringIO(r.text))
@@ -30,10 +37,7 @@ def fetch_stooq_csv(symbol: str, interval: str = "d") -> pd.DataFrame:
     raise RuntimeError("Stooq CSV not available")
 
 def fetch_yahoo_last(symbol: str) -> float:
-    """
-    Получаем последнюю цену из Yahoo Finance JSON chart API.
-    Примеры тикеров: KC=F (Arabica), RC=F (Robusta)
-    """
+    """Последняя цена с Yahoo Finance (chart API). Примеры: KC=F, RM=F."""
     headers = {"User-Agent": "Mozilla/5.0"}
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"range": "5d", "interval": "1d"}
@@ -42,7 +46,7 @@ def fetch_yahoo_last(symbol: str) -> float:
     j = r.json()
     res = j["chart"]["result"][0]
     price = res["meta"].get("regularMarketPrice")
-    if not price:
+    if price is None:
         closes = res["indicators"]["quote"][0]["close"]
         price = [x for x in closes if x is not None][-1]
     return float(price)
@@ -51,46 +55,46 @@ def fetch_yahoo_last(symbol: str) -> float:
 def get_live_prices():
     data = {}
 
-    # --- Arabica ---
+    # Arabica (¢/lb)
     try:
         kc = fetch_stooq_csv("kc.f")
         last_kc = float(kc.iloc[-1]["close"])
         data["KC.F"] = {
-            "last_raw": last_kc,           # ¢/lb
+            "last_raw": last_kc,
             "unit": "¢/lb",
             "usdkg": arabica_centlb_to_usd_per_kg(last_kc),
-            "source": "Stooq"
+            "source": "Stooq",
         }
     except Exception:
         try:
-            last_kc = fetch_yahoo_last("KC=F")   # тоже ¢/lb
+            last_kc = fetch_yahoo_last("KC=F")
             data["KC.F"] = {
                 "last_raw": last_kc,
                 "unit": "¢/lb",
                 "usdkg": arabica_centlb_to_usd_per_kg(last_kc),
-                "source": "Yahoo"
+                "source": "Yahoo",
             }
         except Exception as e:
             data["KC.F"] = {"error": f"Arabica: {e}"}
 
-    # --- Robusta ---
+    # Robusta (USD/tonne)
     try:
         rm = fetch_stooq_csv("rm.f")
-        last_rm = float(rm.iloc[-1]["close"])    # USD/tonne
+        last_rm = float(rm.iloc[-1]["close"])
         data["RM.F"] = {
             "last_raw": last_rm,
             "unit": "USD/t",
             "usdkg": robusta_usd_per_tonne_to_usd_per_kg(last_rm),
-            "source": "Stooq"
+            "source": "Stooq",
         }
     except Exception:
         try:
-            last_rm = fetch_yahoo_last("RC=F")   # Robusta ICE Europe, USD/tonne
+            last_rm = fetch_yahoo_last("RM=F")  # <-- ВАЖНО: RM=F, не RC=F
             data["RM.F"] = {
                 "last_raw": last_rm,
                 "unit": "USD/t",
                 "usdkg": robusta_usd_per_tonne_to_usd_per_kg(last_rm),
-                "source": "Yahoo"
+                "source": "Yahoo",
             }
         except Exception as e:
             data["RM.F"] = {"error": f"Robusta: {e}"}
@@ -98,130 +102,25 @@ def get_live_prices():
     data["ts"] = datetime.now(timezone.utc).isoformat()
     return data
 
-def compute_customs_value(incoterm: str, goods_value: float, freight: float, insurance: float) -> float:
-    inc = incoterm.upper()
-    if inc in ["FOB","EXW"]:
-        return goods_value + freight + insurance
-    if inc == "CFR":
-        return goods_value + insurance
-    # CIF (и прочие) — считаем, что уже включает фрахт+страховку
-    return goods_value
-
-def compute_quote(usd_per_kg, weight_kg, incoterm, freight, insurance, duty_rate, duty_sp_perkg, vat_rate, fees):
-    goods_value = usd_per_kg * weight_kg
-    cv = compute_customs_value(incoterm, goods_value, freight, insurance)
-    duty_ad = cv * duty_rate
-    duty_sp = duty_sp_perkg * weight_kg
-    duty_total = duty_ad + duty_sp
-
-    def fee_amt(f):
-        if f["kind"]=="fixed": return float(f.get("amount",0))
-        base = f.get("base","CV")
-        base_val = cv if base=="CV" else goods_value if base=="Goods" else cv + duty_total
-        return float(f.get("rate",0))*base_val
-
-    fees_list = [{"name": f.get("name","Fee"), "amount": fee_amt(f), "vat_base": bool(f.get("vat_base",True))} for f in fees]
-    fees_total = sum(f["amount"] for f in fees_list)
-    vat_base = cv + duty_total + sum(f["amount"] for f in fees_list if f["vat_base"])
-    vat = vat_base * vat_rate
-    total = cv + duty_total + fees_total + vat
-    per_kg = total / max(1.0, weight_kg)
-
-    return {
-        "goods_value": goods_value, "customs_value": cv,
-        "duty_ad": duty_ad, "duty_sp": duty_sp, "duty_total": duty_total,
-        "fees": fees_list, "fees_total": fees_total,
-        "vat_base": vat_base, "vat": vat,
-        "total": total, "per_kg": per_kg
-    }
-
-def make_result_df(b, currency="USD"):
-    rows = [
-        ["Goods value", b["goods_value"], currency],
-        ["Customs value (CV)", b["customs_value"], currency],
-        ["Duty (ad val.)", b["duty_ad"], currency],
-        ["Duty (specific)", b["duty_sp"], currency],
-        ["Duty total", b["duty_total"], currency],
-        ["Fees total", b["fees_total"], currency],
-        ["VAT base", b["vat_base"], currency],
-        ["VAT", b["vat"], currency],
-        ["Landed total", b["total"], currency],
-        ["Per kg", b["per_kg"], f"{currency}/kg"]
-    ]
-    return pd.DataFrame(rows, columns=["Metric","Value","Unit"])
-
-def export_excel(b, calc_params):
-    df_main = make_result_df(b)
-    df_fees = pd.DataFrame([{"Fee": f["name"], "Amount": f["amount"], "In VAT base": f["vat_base"]} for f in b["fees"]])
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        pd.DataFrame([calc_params]).to_excel(writer, index=False, sheet_name="Input")
-        df_main.to_excel(writer, index=False, sheet_name="Result")
-        df_fees.to_excel(writer, index=False, sheet_name="Fees")
-    buf.seek(0)
-    return buf
-
-def export_pdf(b, calc_params):
-    # Very basic PDF summary with ReportLab
-    buf = BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    w, h = A4
-    y = h - 2*cm
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(2*cm, y, "Coffee Landed Cost — Summary")
-    y -= 1*cm
-    c.setFont("Helvetica", 10)
-    for k,v in calc_params.items():
-        c.drawString(2*cm, y, f"{k}: {v}")
-        y -= 0.5*cm
-        if y < 2*cm:
-            c.showPage(); y = h - 2*cm; c.setFont("Helvetica", 10)
-    y -= 0.5*cm
-    lines = [
-        ("Customs value (CV)", b["customs_value"]),
-        ("Duty ad val.", b["duty_ad"]),
-        ("Duty specific", b["duty_sp"]),
-        ("Duty total", b["duty_total"]),
-        ("Fees total", b["fees_total"]),
-        ("VAT base", b["vat_base"]),
-        ("VAT", b["vat"]),
-        ("Landed total", b["total"]),
-        ("Per kg", b["per_kg"]),
-    ]
-    c.setFont("Helvetica-Bold", 11); c.drawString(2*cm, y, "Result"); y -= 0.7*cm; c.setFont("Helvetica", 10)
-    for name,val in lines:
-        c.drawString(2*cm, y, f"{name}: {val:,.4f} USD")
-        y -= 0.5*cm
-        if y < 2*cm:
-            c.showPage(); y = h - 2*cm; c.setFont("Helvetica", 10)
-    c.showPage()
-    c.save()
-    buf.seek(0)
-    return buf
-
-# ---------- Sidebar: market ----------
+# ---------- Sidebar: market (ОДИН раз) ----------
 with st.sidebar:
     st.subheader("Рынок (бесплатные квоты) — Stooq/Yahoo")
     data = get_live_prices()
     kc = data.get("KC.F", {})
     rm = data.get("RM.F", {})
-
     colA, colB = st.columns(2)
-
     with colA:
         if "error" in kc:
             st.error(kc["error"])
         else:
             st.metric("Arabica (KC)", f"{kc['last_raw']:.2f} {kc.get('unit','')}")
             st.caption(f"≈ {kc['usdkg']:.3f} $/кг • Source: {kc.get('source','?')}")
-
     with colB:
         if "error" in rm:
             st.error(rm["error"])
         else:
             st.metric("Robusta (RM)", f"{rm['last_raw']:.2f} {rm.get('unit','')}")
             st.caption(f"≈ {rm['usdkg']:.3f} $/кг • Source: {rm.get('source','?')}")
-
     st.caption("Квоты с задержкой. Для сделок сверяйте с брокером/биржей.")
 
 # ---------- Stage A & B Starters ----------
