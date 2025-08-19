@@ -11,7 +11,18 @@ from io import BytesIO
 
 st.set_page_config(page_title="Coffee Landed Cost — MVP", page_icon="☕", layout="wide")
 st.title("☕ Coffee Landed Cost — MVP")
-st.caption("Бесплатные котировки (Stooq, задержка) + базовые формулы FOB/CFR/CIF. Не является торговой рекомендацией или таможенным решением.")
+st.caption(with colA:
+    if "error" in kc:
+        st.error(kc["error"])
+    else:
+        st.metric("Arabica (KC)", f"{kc['last_raw']:.2f} {kc.get('unit','')}")
+        st.caption(f"≈ {kc['usdkg']:.3f} $/кг • Source: {kc.get('source','?')}")
+with colB:
+    if "error" in rm:
+        st.error(rm["error"])
+    else:
+        st.metric("Robusta (RM)", f"{rm['last_raw']:.2f} {rm.get('unit','')}")
+        st.caption(f"≈ {rm['usdkg']:.3f} $/кг • Source: {rm.get('source','?')}"))
 
 # ---------- Helpers ----------
 @st.cache_data(ttl=600)
@@ -33,26 +44,87 @@ def robusta_usd_per_tonne_to_usd_per_kg(usd_per_tonne: float) -> float:
     return usd_per_tonne/1000.0
 
 @st.cache_data(ttl=600)
+def fetch_stooq_csv(symbol: str, interval: str = "d") -> pd.DataFrame:
+    # более дружелюбный User-Agent и два домена
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for base in ["https://stooq.com", "https://stooq.pl"]:
+        url = f"{base}/q/d/l/?s={symbol}&i={interval}"
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.ok and r.text.strip():
+            # иногда Stooq возвращает HTML/сообщение — проверяем, что первая строка про колонки CSV
+            first_line = r.text.splitlines()[0].lower()
+            if "date" in first_line and "close" in first_line:
+                df = pd.read_csv(io.StringIO(r.text))
+                df.columns = [c.strip().lower() for c in df.columns]
+                return df.dropna()
+    raise RuntimeError("Stooq CSV not available")
+
+def fetch_yahoo_last(symbol: str) -> float:
+    """
+    Получаем последнюю цену из Yahoo Finance JSON chart API.
+    Примеры тикеров: KC=F (Arabica), RC=F (Robusta)
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"range": "5d", "interval": "1d"}
+    r = requests.get(url, headers=headers, params=params, timeout=10)
+    r.raise_for_status()
+    j = r.json()
+    res = j["chart"]["result"][0]
+    price = res["meta"].get("regularMarketPrice")
+    if not price:
+        closes = res["indicators"]["quote"][0]["close"]
+        price = [x for x in closes if x is not None][-1]
+    return float(price)
+
+@st.cache_data(ttl=600)
 def get_live_prices():
     data = {}
+
+    # --- Arabica ---
     try:
-        kc = fetch_stooq_csv("kc.f").dropna()
+        kc = fetch_stooq_csv("kc.f")
+        last_kc = float(kc.iloc[-1]["close"])
         data["KC.F"] = {
-            "last_raw": float(kc.iloc[-1]["close"]),
+            "last_raw": last_kc,           # ¢/lb
             "unit": "¢/lb",
+            "usdkg": arabica_centlb_to_usd_per_kg(last_kc),
+            "source": "Stooq"
         }
-        data["KC.F"]["usdkg"] = arabica_centlb_to_usd_per_kg(data["KC.F"]["last_raw"])
-    except Exception as e:
-        data["KC.F"] = {"error": str(e)}
+    except Exception:
+        try:
+            last_kc = fetch_yahoo_last("KC=F")   # тоже ¢/lb
+            data["KC.F"] = {
+                "last_raw": last_kc,
+                "unit": "¢/lb",
+                "usdkg": arabica_centlb_to_usd_per_kg(last_kc),
+                "source": "Yahoo"
+            }
+        except Exception as e:
+            data["KC.F"] = {"error": f"Arabica: {e}"}
+
+    # --- Robusta ---
     try:
-        rm = fetch_stooq_csv("rm.f").dropna()
+        rm = fetch_stooq_csv("rm.f")
+        last_rm = float(rm.iloc[-1]["close"])    # USD/tonne
         data["RM.F"] = {
-            "last_raw": float(rm.iloc[-1]["close"]),
+            "last_raw": last_rm,
             "unit": "USD/t",
+            "usdkg": robusta_usd_per_tonne_to_usd_per_kg(last_rm),
+            "source": "Stooq"
         }
-        data["RM.F"]["usdkg"] = robusta_usd_per_tonne_to_usd_per_kg(data["RM.F"]["last_raw"])
-    except Exception as e:
-        data["RM.F"] = {"error": str(e)}
+    except Exception:
+        try:
+            last_rm = fetch_yahoo_last("RC=F")   # Robusta ICE Europe, USD/tonne
+            data["RM.F"] = {
+                "last_raw": last_rm,
+                "unit": "USD/t",
+                "usdkg": robusta_usd_per_tonne_to_usd_per_kg(last_rm),
+                "source": "Yahoo"
+            }
+        except Exception as e:
+            data["RM.F"] = {"error": f"Robusta: {e}"}
+
     data["ts"] = datetime.now(timezone.utc).isoformat()
     return data
 
