@@ -1,15 +1,17 @@
-import os, re, io, json
+import io
+import os
+import re
+import json
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 
 import requests
 import pandas as pd
-import numpy as np
 import streamlit as st
 
-# ---- PDF (опционально) ----------------------------------------------------
+# ---------- PDF (опционально) ----------
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
@@ -18,14 +20,14 @@ try:
 except Exception:
     REPORTLAB_OK = False
 
-# ---- Page -----------------------------------------------------------------
+# ---------- Page ----------
 st.set_page_config(page_title="Coffee Landed Cost — MVP", page_icon="☕", layout="wide")
 st.title("☕ Coffee Landed Cost — MVP")
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 
-# ---- Helpers ---------------------------------------------------------------
+# ---------- Small utils ----------
 def fmt_ts(ts: Optional[int]) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M UTC") if ts else "n/a"
 
@@ -37,14 +39,49 @@ def load_json(filename: str, default: dict) -> dict:
     except Exception:
         return default
 
-# ---- Conversions -----------------------------------------------------------
+# ---------- Units / conversions ----------
 def arabica_centlb_to_usd_per_kg(cents_per_lb: float) -> float:
     return (float(cents_per_lb) / 100.0) / 0.45359237
 
 def robusta_usd_per_tonne_to_usd_per_kg(usd_per_tonne: float) -> float:
     return float(usd_per_tonne) / 1000.0
 
-# ---- Stooq fetcher ---------------------------------------------------------
+# ---------- HTTP session with retries ----------
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+}
+
+def _retry_obj():
+    # совместимость с urllib3 v1/v2
+    try:
+        return Retry(
+            total=3,
+            backoff_factor=0.6,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=frozenset(["GET"]),
+            raise_on_status=False,
+        )
+    except TypeError:  # urllib3 v1.x
+        return Retry(
+            total=3,
+            backoff_factor=0.6,
+            status_forcelist=[429, 500, 502, 503, 504],
+            method_whitelist=frozenset(["GET"]),
+            raise_on_status=False,
+        )
+
+def _http_session() -> requests.Session:
+    s = requests.Session()
+    s.mount("https://", HTTPAdapter(max_retries=_retry_obj()))
+    return s
+
+# ---------- Stooq fetchers (для Robusta и бэкапов) ----------
 @st.cache_data(ttl=600)
 def fetch_stooq_csv(symbol: str, interval: str = "d") -> pd.DataFrame:
     """CSV из Stooq (kc.f / rm.f / RMU25.F)."""
@@ -61,7 +98,7 @@ def fetch_stooq_csv(symbol: str, interval: str = "d") -> pd.DataFrame:
     raise RuntimeError(f"Stooq CSV not available for {symbol}")
 
 def stooq_front_series_symbol(base_symbol: str = "rm.f") -> Optional[str]:
-    """Находим актуальную серию робусты (например, RMU25.F)."""
+    """Находим актуальную серию робусты (например RMU25.F)."""
     headers = {"User-Agent": "Mozilla/5.0"}
     url = f"https://stooq.com/q/f/?s={base_symbol}"
     r = requests.get(url, headers=headers, timeout=10)
@@ -70,13 +107,15 @@ def stooq_front_series_symbol(base_symbol: str = "rm.f") -> Optional[str]:
     m = re.search(r"RM[A-Z]\d{2}\.F", r.text, re.IGNORECASE)
     return m.group(0).upper() if m else None
 
-# ---- Yahoo fetchers --------------------------------------------------------
+# ---------- Yahoo fetchers ----------
 def fetch_yahoo_intraday_last(symbol: str, interval: str = "1m", range_: str = "1d") -> Tuple[float, Optional[int]]:
-    """Последняя непустая свеча Yahoo (интрадей). Возвращает (price, unix_ts_utc)."""
-    headers = {"User-Agent": "Mozilla/5.0"}
+    """
+    Последняя непустая свеча Yahoo (chart v8). Возвращает (price, unix_ts_utc).
+    """
+    sess = _http_session()
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"range": range_, "interval": interval}
-    r = requests.get(url, headers=headers, params=params, timeout=10)
+    r = sess.get(url, headers=HEADERS, params=params, timeout=10)
     r.raise_for_status()
     j = r.json()["chart"]["result"][0]
     closes = j["indicators"]["quote"][0]["close"] or []
@@ -92,33 +131,55 @@ def fetch_yahoo_intraday_last(symbol: str, interval: str = "1m", range_: str = "
     return last, last_ts
 
 @st.cache_data(ttl=60)
-def yahoo_quote_multi(symbols: List[str]) -> dict:
-    """Yahoo quote v7 (не HTML-страница). Возвращает {symbol: {price, ts}}."""
+def yahoo_quote_multi(symbols: List[str]) -> Dict[str, Dict]:
+    """
+    Yahoo quote v7 (не HTML). Возвращает {symbol: {price, ts}}.
+    Делает:
+      • чанки по 8 символов,
+      • ретраи с backoff,
+      • фолбэк на chart v8 по каждому символу при ошибке.
+    """
+    out: Dict[str, Dict] = {}
     if not symbols:
-        return {}
-    headers = {"User-Agent": "Mozilla/5.0"}
-    url = "https://query1.finance.yahoo.com/v7/finance/quote"
-    params = {"symbols": ",".join(symbols)}
-    r = requests.get(url, headers=headers, params=params, timeout=10)
-    r.raise_for_status()
-    res = r.json()["quoteResponse"]["result"]
-    out = {}
-    for row in res:
-        sym = row.get("symbol")
-        price = row.get("regularMarketPrice")
-        ts = row.get("regularMarketTime")
-        if sym and price is not None:
-            out[sym] = {"price": float(price), "ts": int(ts) if ts else None}
+        return out
+
+    sess = _http_session()
+
+    def fetch_chunk(chunk: List[str]) -> None:
+        url = "https://query1.finance.yahoo.com/v7/finance/quote"
+        try:
+            r = sess.get(url, headers=HEADERS, params={"symbols": ",".join(chunk)}, timeout=10)
+            r.raise_for_status()
+            res = r.json().get("quoteResponse", {}).get("result", [])
+            for row in res:
+                sym = row.get("symbol")
+                price = row.get("regularMarketPrice")
+                ts = row.get("regularMarketTime")
+                if sym and price is not None:
+                    out[sym] = {"price": float(price), "ts": int(ts) if ts else None}
+        except Exception:
+            # фолбэк на v8 по каждому
+            for sym in chunk:
+                try:
+                    price, ts = fetch_yahoo_intraday_last(sym, interval="1m", range_="1d")
+                    out[sym] = {"price": float(price), "ts": ts}
+                except Exception:
+                    pass
+
+    CHUNK = 8
+    for i in range(0, len(symbols), CHUNK):
+        fetch_chunk(symbols[i:i + CHUNK])
+
     return out
 
-# ---- KC futures board (Arabica) -------------------------------------------
+# ---------- KC futures board (Arabica) ----------
 MONTHS = [(3, "H"), (5, "K"), (7, "N"), (9, "U"), (12, "Z")]  # Mar/May/Jul/Sep/Dec
 
-def next_kc_contracts(n: int = 8, now: Optional[datetime] = None) -> List[dict]:
-    """Список ближайших KC контрактов: [{'contract':'KCU25','yahoo':'KCU25=F'}, ...]"""
+def next_kc_contracts(n: int = 8, now: Optional[datetime] = None) -> List[Dict]:
+    """Список ближайших KC: [{'contract':'KCU25','yahoo':'KCU25=F'}, ...]"""
     now = now or datetime.now(timezone.utc)
     y, m = now.year, now.month
-    # стартовый индекс в цикле
+    # стартовый индекс
     start_idx = None
     for i, (mm, _) in enumerate(MONTHS):
         if m <= mm:
@@ -140,10 +201,22 @@ def next_kc_contracts(n: int = 8, now: Optional[datetime] = None) -> List[dict]:
     return out
 
 @st.cache_data(ttl=60)
-def get_kc_futures_board(n: int = 8, seed: int = 0) -> List[dict]:
-    """Доска KC: [{'contract','yahoo','price_cents_lb','usdkg','asof','is_front'}]."""
-    rows = next_kc_contracts(n=n)
-    quotes = yahoo_quote_multi([r["yahoo"] for r in rows])
+def get_kc_futures_board(n: int = 8, seed: int = 0) -> List[Dict]:
+    """
+    Возвращает [{'contract','yahoo','price_cents_lb','usdkg','asof','is_front'}].
+    Не бросает исключений — максимум вернёт пустые/частичные цены.
+    """
+    try:
+        rows = next_kc_contracts(n=n)
+    except Exception:
+        rows = []
+
+    quotes = {}
+    try:
+        quotes = yahoo_quote_multi([r["yahoo"] for r in rows])
+    except Exception:
+        quotes = {}
+
     out = []
     for i, r in enumerate(rows):
         q = quotes.get(r["yahoo"], {})
@@ -155,11 +228,11 @@ def get_kc_futures_board(n: int = 8, seed: int = 0) -> List[dict]:
             "price_cents_lb": price,
             "usdkg": arabica_centlb_to_usd_per_kg(price) if price is not None else None,
             "asof": asof,
-            "is_front": i == 0,  # самый ближайший
+            "is_front": i == 0,
         })
     return out
 
-# ---- Robusta cascade (Stooq -> Stooq(front) -> Yahoo 1m) ------------------
+# ---------- Robusta: Stooq -> Stooq(front) -> Yahoo 1m ----------
 @st.cache_data(ttl=900)
 def get_robusta_prices(seed: int = 0,
                        rm_yahoo_candidates: Tuple[str, ...] = ("RC=F", "RM=F")) -> dict:
@@ -199,7 +272,7 @@ def get_robusta_prices(seed: int = 0,
     data["ts"] = datetime.now(timezone.utc).isoformat()
     return data
 
-# ---- Core calc -------------------------------------------------------------
+# ---------- Calculator core ----------
 def compute_customs_value(incoterm: str, goods_value: float, freight: float, insurance: float) -> float:
     inc = incoterm.upper()
     if inc in {"FOB", "EXW"}: return goods_value + freight + insurance
@@ -279,27 +352,34 @@ def export_pdf(b, calc_params):
         if y < 2*cm: c.showPage(); y = h - 2*cm; c.setFont("Helvetica", 10)
     c.showPage(); c.save(); buf.seek(0); return buf
 
-# ---- Sidebar ---------------------------------------------------------------
+# ---------- Sidebar ----------
 with st.sidebar:
     st.subheader("Arabica — контракты (Yahoo futures)")
     if "refresh_seed" not in st.session_state: st.session_state["refresh_seed"] = 0
     if st.button("↻ Обновить котировки"): st.session_state["refresh_seed"] += 1
 
-    board = get_kc_futures_board(n=8, seed=st.session_state["refresh_seed"])
-    if not board or board[0]["price_cents_lb"] is None:
-        st.error("Не удалось получить котировки KC с Yahoo.")
+    try:
+        board = get_kc_futures_board(n=8, seed=st.session_state["refresh_seed"])
+    except Exception:
+        board = []
+
+    if not board:
+        st.error("Не удалось собрать список контрактов KC.")
         kc_selected_row = None
     else:
         options = [row["contract"] for row in board]
-        default_idx = 0  # front-month
-        sel = st.selectbox("Выберите контракт", options, index=default_idx, key="kc_pick")
-        kc_selected_row = next(r for r in board if r["contract"] == sel)
+        sel = st.selectbox("Выберите контракт", options, index=0, key="kc_pick")
+        kc_selected_row = next((r for r in board if r["contract"] == sel), None)
 
-        st.metric("Текущий контракт (front)", board[0]["contract"])
-        st.caption(
-            f"{board[0]['contract']} • {board[0]['price_cents_lb']:.2f} ¢/lb • "
-            f"≈ {board[0]['usdkg']:.3f} $/кг • as of {fmt_ts(board[0]['asof'])}"
-        )
+        # Front-month метрика (даже если селектор про другое)
+        if board[0]["price_cents_lb"] is not None:
+            st.metric("Текущий контракт (front)", board[0]["contract"])
+            st.caption(
+                f"{board[0]['contract']} • {board[0]['price_cents_lb']:.2f} ¢/lb • "
+                f"≈ {board[0]['usdkg']:.3f} $/кг • as of {fmt_ts(board[0]['asof'])}"
+            )
+        else:
+            st.warning("Котировки сейчас недоступны — попробуйте обновить.")
 
     st.divider()
     st.subheader("Robusta — котировки")
@@ -327,7 +407,7 @@ with st.sidebar:
 
     st.caption("Котировки ознакомительные. Для сделок сверяйте с брокером/биржей.")
 
-# ---- Main form -------------------------------------------------------------
+# ---------- Main form ----------
 st.header("Калькулятор")
 
 src = st.radio("Источник цены", ["Онлайн фьючерс (Yahoo, контракт KC)", "Введу вручную"], horizontal=True)
@@ -335,7 +415,9 @@ src = st.radio("Источник цены", ["Онлайн фьючерс (Yahoo
 col1, col2, col3 = st.columns(3)
 with col1:
     instrument = st.selectbox("Инструмент", ["Arabica (KC.F)", "Robusta (RM.F)"])
+
 with col2:
+    # базовая цена $/кг из рынка/ручная
     if src == "Онлайн фьючерс (Yahoo, контракт KC)":
         if instrument.startswith("Arabica"):
             if kc_selected_row and kc_selected_row["usdkg"] is not None:
@@ -355,6 +437,7 @@ with col2:
                 base_usdkg = float(market_usdkg)
     else:
         base_usdkg = st.number_input("Базовая цена $/кг", min_value=0.0, value=3.000, step=0.001)
+
 with col3:
     diff = st.number_input("Дифференциал $/кг (±)", value=0.000, step=0.010, help="Добавка/скидка к базовой цене")
 
@@ -378,9 +461,11 @@ with colw3:
 
 # Jurisdiction presets
 st.markdown("**Юрисдикция (НДС/пошлина пресет)**")
-jur_defaults = {"EAEU - Belarus": {"vat_rate": 0.20, "duty_rate": 0.00},
-                "EAEU - Russia":  {"vat_rate": 0.20, "duty_rate": 0.00},
-                "UAE":            {"vat_rate": 0.05, "duty_rate": 0.00}}
+jur_defaults = {
+    "EAEU - Belarus": {"vat_rate": 0.20, "duty_rate": 0.00},
+    "EAEU - Russia":  {"vat_rate": 0.20, "duty_rate": 0.00},
+    "UAE":            {"vat_rate": 0.05, "duty_rate": 0.00},
+}
 jur_data = load_json("jurisdictions.json", jur_defaults)
 colsj1, colsj2 = st.columns(2)
 with colsj1:
@@ -395,9 +480,11 @@ duty_sp_perkg = st.number_input("Пошлина (специф., $/кг)", min_va
 
 # Route presets (для CFR/CIF)
 st.markdown("**Маршрут (для CFR/CIF пресеты фрахта/страховки)**")
-routes_defaults = {"Santos → Riga": {"incoterms": ["CFR", "CIF"], "freight": 1800, "insurance": 80},
-                   "Santos → Dubai": {"incoterms": ["CFR", "CIF"], "freight": 1600, "insurance": 70},
-                   "Jebel Ali → Riyadh": {"incoterms": ["CFR", "CIF"], "freight": 600, "insurance": 40}}
+routes_defaults = {
+    "Santos → Riga": {"incoterms": ["CFR", "CIF"], "freight": 1800, "insurance": 80},
+    "Santos → Dubai": {"incoterms": ["CFR", "CIF"], "freight": 1600, "insurance": 70},
+    "Jebel Ali → Riyadh": {"incoterms": ["CFR", "CIF"], "freight": 600, "insurance": 40},
+}
 routes = load_json("routes.json", routes_defaults)
 route_names = ["(не использ.)"] + list(routes.keys())
 colr1, colr2, colr3 = st.columns(3)
