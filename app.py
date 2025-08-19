@@ -1,138 +1,134 @@
-import io, json
-from io import BytesIO
+import io, csv, time, random, json
 from pathlib import Path
-from datetime import datetime, timezone
 from typing import Optional, Dict
 
 import requests
 import pandas as pd
 import streamlit as st
 
-# ====== КОНСТАНТЫ ===========================================================
-ARABICA_SERIES = "KCZ25.F"   # Arabica (ICE US) — только эта серия
-ROBUSTA_SERIES = "RMU25.F"   # Robusta (ICE Europe) — только эта серия
-CACHE_TTL_SEC  = 900         # 15 минут
-UA_HEADERS     = {"User-Agent": "Mozilla/5.0"}
+# ========================= КОНСТАНТЫ =========================
+STOOQ_CACHE_TTL = 900  # кэш 15 минут
+UA = {"User-Agent": "Mozilla/5.0"}
+STOOQ_DOMAINS = ("https://stooq.com", "https://stooq.pl")  # пробуем оба
+ARABICA_SYMBOL = "KC.F"   # Arabica continuous (¢/lb)
+ROBUSTA_SYMBOL = "RM.F"   # Robusta continuous (USD/t)
 
 st.set_page_config(page_title="Coffee Landed Cost — MVP", page_icon="☕", layout="wide")
-st.title("☕ Coffee Landed Cost — MVP (Stooq snapshot + EOD fallback)")
+st.title("☕ Coffee Landed Cost — MVP (Stooq: KC.F / RM.F)")
 
-BASE_DIR = Path(__file__).parent
-DATA_DIR = BASE_DIR / "data"
+# ======================= ВСПОМОГАТЕЛЬНОЕ =====================
+def kc_centslb_to_usdkg(x: float) -> float:
+    """¢/lb -> $/kg"""
+    return (float(x) / 100.0) / 0.45359237
 
-# ====== УТИЛИТЫ =============================================================
-def fmt_asof(asof: Optional[str]) -> str:
-    return asof if asof else "n/a"
+def rm_usdt_to_usdkg(x: float) -> float:
+    """USD/tonne -> $/kg"""
+    return float(x) / 1000.0
 
-def arabica_centlb_to_usd_per_kg(cents_per_lb: float) -> float:
-    return (float(cents_per_lb) / 100.0) / 0.45359237
-
-def robusta_usd_per_tonne_to_usd_per_kg(usd_per_tonne: float) -> float:
-    return float(usd_per_tonne) / 1000.0
-
-def load_json(filename: str, default: dict) -> dict:
-    p = DATA_DIR / filename
+def _http_get_text(url: str, params: dict | None = None, timeout: float = 14.0) -> tuple[Optional[str], Dict]:
+    """GET с фильтром HTML; вернёт (text|None, meta)."""
+    meta = {"url": url, "params": params, "status": None, "ctype": None, "err": None}
     try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
+        r = requests.get(url, headers=UA, params=params, timeout=timeout)
+        meta["status"] = r.status_code
+        meta["ctype"] = r.headers.get("Content-Type", "")
+        if not r.ok:
+            return None, meta
+        text = r.text
+        if not text or "<html" in text.lower():
+            return None, meta
+        return text, meta
+    except Exception as e:
+        meta["err"] = f"{type(e).__name__}: {e}"
+        return None, meta
+
+def _try_domains(path: str, params: dict, retries: int = 3) -> tuple[Optional[str], Dict]:
+    """Перебираем stooq.com и stooq.pl, по каждому — до N попыток с джиттером."""
+    last_meta: Dict = {}
+    for base in STOOQ_DOMAINS:
+        for attempt in range(retries):
+            text, meta = _http_get_text(base + path, params=params)
+            if text:
+                meta["domain"] = base
+                return text, meta
+            last_meta = {**meta, "domain": base, "attempt": attempt + 1}
+            time.sleep(0.2 + random.random()*0.5)
+    return None, last_meta
+
+def _parse_snapshot(text: str, expect_symbol: str) -> Optional[Dict]:
+    """Парсим /q/l CSV: Symbol,Date,Time,Open,High,Low,Close,Volume."""
+    reader = csv.DictReader(io.StringIO(text))
+    row = next(reader, None)
+    if not row:
+        return None
+    symbol = (row.get("Symbol") or "").strip().upper()
+    if symbol != expect_symbol.upper():  # иногда Stooq подсовывает другой символ
+        return None
+    try:
+        close = float(row["Close"])
     except Exception:
-        return default
-
-# ====== STOOQ: SNAPSHOT (/q/l) + EOD CSV (/q/d/l) ===========================
-def _stooq_snapshot(symbol: str) -> Optional[dict]:
-    """
-    Интрадей-снапшот: https://stooq.com/q/l/?s=<symbol>&f=sd2t2ohlcv&h&e=csv
-    Возвращает {'last_raw', 'unit', 'usdkg', 'asof', 'source'} или None.
-    """
-    url = "https://stooq.com/q/l/"
-    params = {"s": symbol.lower(), "f": "sd2t2ohlcv", "h": "", "e": "csv"}
-    r = requests.get(url, headers=UA_HEADERS, params=params, timeout=12)
-    r.raise_for_status()
-
-    # Пример CSV: Symbol,Date,Time,Open,High,Low,Close,Volume
-    df = pd.read_csv(io.StringIO(r.text))
-    if df.empty:
         return None
-    cols = [c.strip().lower() for c in df.columns]
-    row = df.iloc[0]
-    symbol_csv = str(row[cols[0]]).upper()
-    if symbol_csv != symbol.upper():
-        return None
-
-    close_val = float(row["close" if "close" in cols else cols[-2]])
-    date_val  = str(row["date"  if "date"  in cols else cols[1]])
-    time_val  = str(row["time"  if "time"  in cols else cols[2]])
-
-    if symbol.upper().startswith("KC"):
-        unit = "¢/lb"
-        usdkg = arabica_centlb_to_usd_per_kg(close_val)
-    elif symbol.upper().startswith("RM"):
-        unit = "USD/t"
-        usdkg = robusta_usd_per_tonne_to_usd_per_kg(close_val)
+    date = (row.get("Date") or "").strip()
+    time_ = (row.get("Time") or "").strip()
+    if symbol.startswith("KC"):
+        unit, usdkg = "¢/lb", kc_centslb_to_usdkg(close)
+    elif symbol.startswith("RM"):
+        unit, usdkg = "USD/t", rm_usdt_to_usdkg(close)
     else:
-        unit, usdkg = "", None
+        return None
+    return {"last_raw": close, "unit": unit, "usdkg": usdkg,
+            "asof": f"{date} {time_} (Stooq snapshot)", "source": "Stooq /q/l"}
 
-    return {
-        "last_raw": close_val,
-        "unit": unit,
-        "usdkg": usdkg,
-        "asof": f"{date_val} {time_val} (Stooq snapshot)",
-        "source": "Stooq /q/l"
-    }
-
-def _stooq_eod(symbol: str) -> dict:
-    """
-    Дневной CSV (EOD): https://stooq.pl/q/d/l/?s=<symbol>&i=d
-    Возвращает {'last_raw','unit','usdkg','asof','source'}.
-    """
-    for base in ("https://stooq.pl", "https://stooq.com"):
-        url = f"{base}/q/d/l/?s={symbol.lower()}&i=d"
-        r = requests.get(url, headers=UA_HEADERS, timeout=12)
-        if not r.ok or not r.text.strip():
-            continue
-        df = pd.read_csv(io.StringIO(r.text))
-        if df.empty or "Close" not in df.columns:
-            continue
-        last = df.iloc[-1]
-        close_val = float(last["Close"])
-        date_val  = str(last["Date"])
-        if symbol.upper().startswith("KC"):
-            unit = "¢/lb"
-            usdkg = arabica_centlb_to_usd_per_kg(close_val)
-        elif symbol.upper().startswith("RM"):
-            unit = "USD/t"
-            usdkg = robusta_usd_per_tonne_to_usd_per_kg(close_val)
-        else:
-            unit, usdkg = "", None
-        return {
-            "last_raw": close_val,
-            "unit": unit,
-            "usdkg": usdkg,
-            "asof": f"{date_val} (EOD)",
-            "source": "Stooq /q/d/l"
-        }
-    raise RuntimeError(f"Stooq EOD CSV not available for {symbol}")
-
-@st.cache_data(ttl=CACHE_TTL_SEC)
-def stooq_series_last(symbol: str, seed: int = 0) -> dict:
-    """
-    1) Пытаемся взять интрадей-снапшот (/q/l)
-    2) Если нет — EOD CSV (/q/d/l)
-    seed — просто число для ручного сброса кэша кнопкой.
-    """
-    snap = None
+def _parse_eod(text: str, expect_symbol: str) -> Optional[Dict]:
+    """Парсим /q/d/l CSV: Date,Open,High,Low,Close,Volume."""
+    reader = csv.DictReader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        return None
+    last = rows[-1]
     try:
-        snap = _stooq_snapshot(symbol)
+        close = float(last["Close"])
     except Exception:
-        snap = None
+        return None
+    date = (last.get("Date") or "").strip()
+    if expect_symbol.upper().startswith("KC"):
+        unit, usdkg = "¢/lb", kc_centslb_to_usdkg(close)
+    elif expect_symbol.upper().startswith("RM"):
+        unit, usdkg = "USD/t", rm_usdt_to_usdkg(close)
+    else:
+        return None
+    return {"last_raw": close, "unit": unit, "usdkg": usdkg,
+            "asof": f"{date} (EOD)", "source": "Stooq /q/d/l"}
 
-    if snap and snap.get("usdkg") is not None:
-        return snap
+@st.cache_data(ttl=STOOQ_CACHE_TTL)
+def stooq_latest(symbol: str, seed: int = 0, debug: bool = False) -> Dict:
+    """
+    Возвращает котировку Stooq по непрерывному символу ('KC.F' или 'RM.F').
+    1) /q/l снапшот -> 2) /q/d/l дневной -> иначе RuntimeError.
+    seed — просто число для ручного сброса кэша (кнопка).
+    """
+    sym = symbol.upper()
 
-    # fallback на EOD
-    return _stooq_eod(symbol)
+    # 1) snapshot
+    snap_txt, snap_meta = _try_domains("/q/l/", params={"s": sym.lower(), "f": "sd2t2ohlcv", "h": "", "e": "csv"})
+    if snap_txt:
+        parsed = _parse_snapshot(snap_txt, sym)
+        if parsed:
+            if debug: parsed["_debug"] = {"endpoint": "snapshot", **snap_meta}
+            return parsed
 
-# ====== КАЛЬКУЛЯТОР =========================================================
+    # 2) EOD fallback
+    eod_txt, eod_meta = _try_domains("/q/d/l/", params={"s": sym.lower(), "i": "d"})
+    if eod_txt:
+        parsed = _parse_eod(eod_txt, sym)
+        if parsed:
+            if debug: parsed["_debug"] = {"endpoint": "eod", **eod_meta}
+            return parsed
+
+    meta = snap_meta if snap_meta else eod_meta
+    raise RuntimeError(f"Stooq not available for {sym} (status={meta.get('status')}, ctype={meta.get('ctype')}, err={meta.get('err')})")
+
+# ========================== КАЛЬКУЛЯТОР ======================
 def compute_customs_value(incoterm: str, goods_value: float, freight: float, insurance: float) -> float:
     inc = incoterm.upper()
     if inc in {"FOB", "EXW"}: return goods_value + freight + insurance
@@ -181,54 +177,57 @@ def make_result_df(b, currency="USD"):
     ]
     return pd.DataFrame(rows, columns=["Metric","Value","Unit"])
 
-# ====== САЙДБАР =============================================================
+# ============================ UI: САЙДБАР ====================
 with st.sidebar:
-    st.subheader("Источники (Stooq)")
+    st.subheader("Источники (Stooq: KC.F / RM.F)")
     if "refresh_seed" not in st.session_state: st.session_state["refresh_seed"] = 0
     if st.button("↻ Обновить котировки"): st.session_state["refresh_seed"] += 1
+    debug = st.checkbox("Показать отладку", value=False)
 
     try:
-        arab = stooq_series_last(ARABICA_SERIES, seed=st.session_state["refresh_seed"])
-        st.metric(f"Arabica {ARABICA_SERIES}", f"{arab['last_raw']:.2f} {arab['unit']}")
-        st.caption(f"≈ {arab['usdkg']:.3f} $/кг • {arab['source']} • as of {fmt_asof(arab['asof'])}")
+        kc = stooq_latest(ARABICA_SYMBOL, seed=st.session_state["refresh_seed"], debug=debug)
+        st.metric("Arabica KC.F", f"{kc['last_raw']:.2f} {kc['unit']}")
+        st.caption(f"≈ {kc['usdkg']:.3f} $/кг • {kc['source']} • as of {kc['asof']}")
+        if debug and "_debug" in kc: st.code(json.dumps(kc["_debug"], ensure_ascii=False, indent=2), language="json")
     except Exception as e:
-        arab = {"usdkg": None}
-        st.error(f"Arabica {ARABICA_SERIES}: нет данных ({e})")
+        kc = {"usdkg": None}
+        st.error(f"Arabica KC.F: {e}")
 
     try:
-        robu = stooq_series_last(ROBUSTA_SERIES, seed=st.session_state["refresh_seed"])
-        st.metric(f"Robusta {ROBUSTA_SERIES}", f"{robu['last_raw']:.2f} {robu['unit']}")
-        st.caption(f"≈ {robu['usdkg']:.3f} $/кг • {robu['source']} • as of {fmt_asof(robu['asof'])}")
+        rm = stooq_latest(ROBUSTA_SYMBOL, seed=st.session_state["refresh_seed"], debug=debug)
+        st.metric("Robusta RM.F", f"{rm['last_raw']:.2f} {rm['unit']}")
+        st.caption(f"≈ {rm['usdkg']:.3f} $/кг • {rm['source']} • as of {rm['asof']}")
+        if debug and "_debug" in rm: st.code(json.dumps(rm["_debug"], ensure_ascii=False, indent=2), language="json")
     except Exception as e:
-        robu = {"usdkg": None}
-        st.error(f"Robusta {ROBUSTA_SERIES}: нет данных ({e})")
+        rm = {"usdkg": None}
+        st.error(f"Robusta RM.F: {e}")
 
-    st.caption("Примечание: snapshot у Stooq имеет задержку; если недоступен, берём EOD.")
+    st.caption("Snapshot у Stooq может быть с задержкой; если недоступен — берём EOD.")
 
-# ====== ОСНОВНАЯ ФОРМА ======================================================
+# ============================ UI: ФОРМА ======================
 st.header("Калькулятор")
 
-src = st.radio("Источник цены", ["Онлайн (Stooq: KCZ25.F / RMU25.F)", "Введу вручную"], horizontal=True)
+src = st.radio("Источник цены", ["Онлайн (Stooq: KC.F / RM.F)", "Введу вручную"], horizontal=True)
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    instrument = st.selectbox("Инструмент", ["Arabica (KCZ25.F)", "Robusta (RMU25.F)"])
+    instrument = st.selectbox("Инструмент", ["Arabica (KC.F)", "Robusta (RM.F)"])
 
 with col2:
-    if src == "Онлайн (Stooq: KCZ25.F / RMU25.F)":
+    if src == "Онлайн (Stooq: KC.F / RM.F)":
         if instrument.startswith("Arabica"):
-            if arab.get("usdkg") is not None:
-                st.text_input("Базовая цена $/кг (из KCZ25.F)", value=f"{arab['usdkg']:.4f}", disabled=True)
-                base_usdkg = float(arab["usdkg"])
+            if kc.get("usdkg") is not None:
+                st.text_input("Базовая цена $/кг (из KC.F)", value=f"{kc['usdkg']:.4f}", disabled=True)
+                base_usdkg = float(kc["usdkg"])
             else:
-                st.warning("Нет данных по KCZ25.F — введите вручную.")
+                st.warning("Нет данных по KC.F — введите вручную.")
                 base_usdkg = st.number_input("Базовая цена $/кг", min_value=0.0, value=3.000, step=0.001)
         else:
-            if robu.get("usdkg") is not None:
-                st.text_input("Базовая цена $/кг (из RMU25.F)", value=f"{robu['usdkg']:.4f}", disabled=True)
-                base_usdkg = float(robu["usdkg"])
+            if rm.get("usdkg") is not None:
+                st.text_input("Базовая цена $/кг (из RM.F)", value=f"{rm['usdkg']:.4f}", disabled=True)
+                base_usdkg = float(rm["usdkg"])
             else:
-                st.warning("Нет данных по RMU25.F — введите вручную.")
+                st.warning("Нет данных по RM.F — введите вручную.")
                 base_usdkg = st.number_input("Базовая цена $/кг", min_value=0.0, value=3.000, step=0.001)
     else:
         base_usdkg = st.number_input("Базовая цена $/кг", min_value=0.0, value=3.000, step=0.001)
@@ -254,49 +253,47 @@ with colw2:
 with colw3:
     incoterm = st.selectbox("Incoterm", ["FOB","CFR","CIF"], help="Упрощённая логика")
 
-# Юрисдикция
+# Юрисдикция (простые пресеты)
 st.markdown("**Юрисдикция (НДС/пошлина пресет)**")
-jur_defaults = {
+jur_presets = {
     "EAEU - Belarus": {"vat_rate": 0.20, "duty_rate": 0.00},
     "EAEU - Russia":  {"vat_rate": 0.20, "duty_rate": 0.00},
     "UAE":            {"vat_rate": 0.05, "duty_rate": 0.00},
 }
-jur_data = load_json("jurisdictions.json", jur_defaults)
 colsj1, colsj2 = st.columns(2)
 with colsj1:
-    jname = st.selectbox("Страна/регион", list(jur_data.keys()))
+    jname = st.selectbox("Страна/регион", list(jur_presets.keys()))
 with colsj2:
-    j = jur_data[jname]
+    j = jur_presets[jname]
     vat_rate = st.number_input("Ставка НДС (0..1)", min_value=0.0, max_value=1.0,
                                value=float(j.get("vat_rate", 0.0)), step=0.01)
 duty_rate = st.number_input("Пошлина (адвал., 0..1)", min_value=0.0, max_value=1.0,
                             value=float(j.get("duty_rate", 0.0)), step=0.01)
 duty_sp_perkg = st.number_input("Пошлина (специф., $/кг)", min_value=0.0, value=0.0, step=0.01)
 
-# Маршрут
+# Маршрут (простые пресеты для CFR/CIF)
 st.markdown("**Маршрут (для CFR/CIF пресеты фрахта/страховки)**")
-routes_defaults = {
+route_presets = {
     "Santos → Riga":     {"incoterms": ["CFR","CIF"], "freight": 1800, "insurance": 80},
     "Santos → Dubai":    {"incoterms": ["CFR","CIF"], "freight": 1600, "insurance": 70},
     "Jebel Ali → Riyadh":{"incoterms": ["CFR","CIF"], "freight": 600,  "insurance": 40},
 }
-routes = load_json("routes.json", routes_defaults)
-route_names = ["(не использ.)"] + list(routes.keys())
+route_names = ["(не использ.)"] + list(route_presets.keys())
 colr1, colr2, colr3 = st.columns(3)
 with colr1:
     rsel = st.selectbox("Маршрут", route_names)
 with colr2:
-    if rsel != "(не использ.)" and incoterm in routes[rsel]["incoterms"]:
-        freight = st.number_input("Фрахт (USD)", min_value=0.0, value=float(routes[rsel]["freight"]), step=10.0)
+    if rsel != "(не использ.)" and incoterm in route_presets[rsel]["incoterms"]:
+        freight = st.number_input("Фрахт (USD)", min_value=0.0, value=float(route_presets[rsel]["freight"]), step=10.0)
     else:
         freight = st.number_input("Фрахт (USD)", min_value=0.0, value=1800.0, step=10.0)
 with colr3:
-    if rsel != "(не использ.)" and incoterm in routes[rsel]["incoterms"]:
-        insurance = st.number_input("Страховка (USD)", min_value=0.0, value=float(routes[rsel]["insurance"]), step=5.0)
+    if rsel != "(не использ.)" and incoterm in route_presets[rsel]["incoterms"]:
+        insurance = st.number_input("Страховка (USD)", min_value=0.0, value=float(route_presets[rsel]["insurance"]), step=5.0)
     else:
         insurance = st.number_input("Страховка (USD)", min_value=0.0, value=80.0, step=5.0)
 
-# Сборы
+# Локальные сборы (минимальный редактор)
 st.markdown("**Локальные сборы (стартер)**")
 feec1, feec2, feec3, feec4, _ = st.columns([2,1,1,1,1])
 with feec1:
