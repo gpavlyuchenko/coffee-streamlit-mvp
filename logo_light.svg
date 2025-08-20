@@ -1,0 +1,20 @@
+<svg width="200" height="40" viewBox="0 0 200 40" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g" x1="0" x2="1">
+      <stop offset="0" stop-color="#0FB5A8"/>
+      <stop offset="1" stop-color="#0AA593"/>
+    </linearGradient>
+  </defs>
+  <!-- bean -->
+  <g transform="translate(6,6)">
+    <ellipse cx="14" cy="14" rx="12" ry="14" fill="url(#g)"/>
+    <path d="M9 4 C14 10, 14 18, 9 24" stroke="#ffffff" stroke-width="2" fill="none" opacity="0.9"/>
+  </g>
+  <!-- route arrow -->
+  <path d="M40 20 H160" stroke="#0FB5A8" stroke-width="3" stroke-linecap="round"/>
+  <path d="M160 20 l-8 -6 v12 z" fill="#0FB5A8"/>
+  <!-- wordmark -->
+  <text x="50" y="26" font-family="Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica" font-size="18" fill="#0F172A" font-weight="700">
+    BeanRoute
+  </text>
+</svg>
