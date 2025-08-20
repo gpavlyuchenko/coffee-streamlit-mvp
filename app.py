@@ -1,167 +1,191 @@
-# app.py — BeanRoute (EN/RU), safe boot, clean UI
+# app.py — BeanRoute (EN/RU), no-sidebar UI, safe auto-refresh, Stooq KC.F/RM.F
 
+# ---------- Imports ----------
 import io, csv, time, random, json
-from io import BytesIO
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict
+from datetime import datetime, timezone
 
 import requests
 import pandas as pd
 import streamlit as st
-from datetime import datetime, timezone
 
-# ============================ BRAND / THEME =============================
-APP_NAME   = "BeanRoute"
+# ---------- Brand / Theme ----------
+APP_NAME = "BeanRoute"
 TAGLINE_EN = "Coffee imports, made clear."
 TAGLINE_RU = "Импорт кофе — прозрачно и просто."
-LOGO_PATH  = Path("logo_light.svg")  # если нет файла — покажем текстовый логотип
 
-PRIMARY  = "#0FB5A8"
+LOGO_PATH = Path("logo_light.svg")  # если файла нет — покажем текст
+PRIMARY = "#0F85A8"
 GRAPHITE = "#0F172A"
 
-# ============================ GLOBAL SETTINGS ===========================
-SAFE_BOOT        = True         # не ходим в сеть на холодном старте
-STOOQ_CACHE_TTL  = 900          # 15 минут
-REQ_TIMEOUT      = 2.5          # сек. таймаут HTTP-запросов
-UA               = {"User-Agent": "Mozilla/5.0"}
-STOOQ_DOMAINS    = ("https://stooq.com", "https://stooq.pl")
+# ---------- Global settings ----------
+SAFE_BOOT = True                   # не ходим в сеть на холодном старте
+STOOQ_CACHE_TTL = 900              # кэш 15 минут
+REQ_TIMEOUT = 12.0                 # секунды таймаут на HTTP
+UA = {"User-Agent": "Mozilla/5.0"}
+STOOQ_DOMAINS = ("https://stooq.com", "https://stooq.pl")
 
-ARABICA_SYMBOL   = "KC.F"       # ¢/lb
-ROBUSTA_SYMBOL   = "RM.F"       # USD/tonne
+ARABICA_SYMBOL = "KC.F"            # ¢/lb (continuous)
+ROBUSTA_SYMBOL = "RM.F"            # USD/tonne (continuous)
 
-# ============================ PAGE CONFIG ===============================
+# ---------- i18n ----------
 st.set_page_config(page_title=f"{APP_NAME}", page_icon="☕", layout="wide")
 
-# ============================== I18N ===================================
+if "lang" not in st.session_state:
+    st.session_state["lang"] = "en"
+
+I18N = {
+    "en": {
+        "lang_label": "Language",
+        "tagline": TAGLINE_EN,
+        "refresh": "Refresh quotes",
+        "auto_refresh": "Auto refresh quotes (15 min)",
+        "last_check": "Last check",
+        "market_title": "Market — Stooq (safe boot)",
+        "arabica": "Arabica (KC.F)",
+        "robusta": "Robusta (RM.F)",
+        "approx": "≈",
+        "usdkg": "$/kg",
+        "source": "Source",
+        "asof": "as of",
+        "no_quotes_try_refresh": "Quotes are not available yet — try to refresh.",
+        "calculator": "Calculator",
+        "price_source": "Price source",
+        "online_stooq": "Online (Stooq: KC.F / RM.F)",
+        "manual_input": "Manual input",
+        "instrument": "Instrument",
+        "base_price": "Base price $/kg",
+        "base_price_from_market": "Base price $/kg (from market)",
+        "diff_per_kg": "Differential $/kg (±)",
+        "diff_help": "Positive adds, negative subtracts from base price",
+        "effective_price": "Effective price",
+        "container_weight": "Container / weight",
+        "container": "Container",
+        "weight": "Weight (kg)",
+        "incoterm": "Incoterm",
+        "jurisdiction": "Jurisdiction (VAT/duty preset)",
+        "country_region": "Country/region",
+        "vat_rate": "VAT rate (0..1)",
+        "duty_ad": "Duty (ad val., 0..1)",
+        "duty_sp": "Duty (specific, $/kg)",
+        "route": "Route (CFR/CIF freight/insurance presets)",
+        "freight": "Freight (USD)",
+        "insurance": "Insurance (USD)",
+        "local_fees": "Local fees (starter)",
+        "fee_name": "Name",
+        "fee_type": "Type",
+        "fee_fixed": "fixed",
+        "fee_percent": "percent",
+        "fee_amount": "Amount ($)",
+        "fee_rate": "Rate (%)",
+        "fee_base": "Base",
+        "fee_vat_base": "Include in VAT base",
+        "compute": "Compute",
+        "result": "Result",
+        "landed_total": "Landed total (USD)",
+        "usd_per_kg": "$/kg",
+        "fill_and_compute": "Fill the fields and press “Compute”.",
+    },
+    "ru": {
+        "lang_label": "Язык",
+        "tagline": TAGLINE_RU,
+        "refresh": "Обновить котировки",
+        "auto_refresh": "Авто-обновление котировок (15 мин)",
+        "last_check": "Последняя проверка",
+        "market_title": "Рынок — Stooq (безопасный запуск)",
+        "arabica": "Арабика (KC.F)",
+        "robusta": "Робуста (RM.F)",
+        "approx": "≈",
+        "usdkg": "$/кг",
+        "source": "Источник",
+        "asof": "на",
+        "no_quotes_try_refresh": "Котировки сейчас недоступны — попробуйте обновить.",
+        "calculator": "Калькулятор",
+        "price_source": "Источник цены",
+        "online_stooq": "Онлайн (Stooq: KC.F / RM.F)",
+        "manual_input": "Введу вручную",
+        "instrument": "Инструмент",
+        "base_price": "Базовая цена $/кг",
+        "base_price_from_market": "Базовая цена $/кг (из рынка)",
+        "diff_per_kg": "Дифференциал $/кг (±)",
+        "diff_help": "Плюс — надбавка, минус — скидка к базовой цене",
+        "effective_price": "Эффективная цена",
+        "container_weight": "Контейнер / вес",
+        "container": "Контейнер",
+        "weight": "Вес (кг)",
+        "incoterm": "Incoterm",
+        "jurisdiction": "Юрисдикция (пресет НДС/пошлины)",
+        "country_region": "Страна/регион",
+        "vat_rate": "Ставка НДС (0..1)",
+        "duty_ad": "Пошлина (адвал., 0..1)",
+        "duty_sp": "Пошлина (специф., $/кг)",
+        "route": "Маршрут (пресеты фрахта/страховки для CFR/CIF)",
+        "freight": "Фрахт (USD)",
+        "insurance": "Страховка (USD)",
+        "local_fees": "Локальные сборы (стартер)",
+        "fee_name": "Название",
+        "fee_type": "Тип",
+        "fee_fixed": "фикс.",
+        "fee_percent": "проц.",
+        "fee_amount": "Сумма ($)",
+        "fee_rate": "Ставка (%)",
+        "fee_base": "База",
+        "fee_vat_base": "Включать в базу НДС",
+        "compute": "Рассчитать",
+        "result": "Разбор",
+        "landed_total": "Итого (USD)",
+        "usd_per_kg": "$/кг",
+        "fill_and_compute": "Заполните поля и нажмите «Рассчитать».",
+    },
+}
+
 def T(key: str) -> str:
-    """Simple i18n with safe fallback to EN/keys."""
     lang = st.session_state.get("lang", "en")
-    L = {
-        "en": {
-            "brand": APP_NAME,
-            "tagline": TAGLINE_EN,
-            "language": "Language",
-            "english": "English",
-            "russian": "Русский",
-            "market_title": "Market — Stooq (safe boot)",
-            "refresh": "Refresh quotes",
-            "last_check": "Last check",
-            "arabica": "Arabica (KC.F)",
-            "robusta": "Robusta (RM.F)",
-            "no_quotes": "Quotes are not available yet — try to refresh.",
-            "approx": "≈",
-            "usdkg": "$/kg",
-            "source": "Source",
-            "as_of": "as of",
-            "calc": "Calculator",
-            "price_source": "Price source",
-            "online": "Online (Stooq: KC.F / RM.F)",
-            "manual": "Manual input",
-            "instrument": "Instrument",
-            "base_price": "Base price $/kg",
-            "base_from_kc": "Base price $/kg (from KC.F)",
-            "base_from_rm": "Base price $/kg (from RM.F)",
-            "diff": "Differential $/kg (±)",
-            "effective_price": "Effective price",
-            "container_weight": "Container / weight",
-            "container": "Container",
-            "weight": "Weight (kg)",
-            "incoterm": "Incoterm",
-            "jurisdiction": "Jurisdiction (VAT/duty preset)",
-            "country_region": "Country/region",
-            "vat_rate": "VAT rate (0..1)",
-            "duty_ad": "Duty (ad val., 0..1)",
-            "duty_sp": "Duty (specific, $/kg)",
-            "route": "Route (CFR/CIF freight & insurance)",
-            "route_name": "Route",
-            "freight": "Freight (USD)",
-            "insurance": "Insurance (USD)",
-            "fees": "Local fees (starter)",
-            "fee_name": "Name",
-            "fee_type": "Type",
-            "fee_amount": "Amount ($)",
-            "fee_rate": "Rate (%)",
-            "fee_base": "Base",
-            "fee_in_vat": "Include in VAT base",
-            "btn_calc": "Calculate",
-            "result": "Result",
-            "landed_total": "Landed total (USD)",
-            "per_kg": "$/kg",
-            "summary": "Breakdown",
-            "fill_and_calc": "Fill the fields and press “Calculate”.",
-            "auto_refresh": "Auto refresh quotes (15 min)",
-        },
-        "ru": {
-            "brand": APP_NAME,
-            "tagline": TAGLINE_RU,
-            "language": "Язык",
-            "english": "English",
-            "russian": "Русский",
-            "market_title": "Рынок — Stooq (безопасный запуск)",
-            "refresh": "Обновить котировки",
-            "last_check": "Последняя проверка",
-            "arabica": "Арабика (KC.F)",
-            "robusta": "Робуста (RM.F)",
-            "no_quotes": "Котировки пока недоступны — попробуйте обновить.",
-            "approx": "≈",
-            "usdkg": "$/кг",
-            "source": "Источник",
-            "as_of": "на",
-            "calc": "Калькулятор",
-            "price_source": "Источник цены",
-            "online": "Онлайн (Stooq: KC.F / RM.F)",
-            "manual": "Введу вручную",
-            "instrument": "Инструмент",
-            "base_price": "Базовая цена $/кг",
-            "base_from_kc": "Базовая цена $/кг (из KC.F)",
-            "base_from_rm": "Базовая цена $/кг (из RM.F)",
-            "diff": "Дифференциал $/кг (±)",
-            "effective_price": "Эффективная цена",
-            "container_weight": "Контейнер / вес",
-            "container": "Контейнер",
-            "weight": "Вес (кг)",
-            "incoterm": "Incoterm",
-            "jurisdiction": "Юрисдикция (пресет НДС/пошлина)",
-            "country_region": "Страна/регион",
-            "vat_rate": "Ставка НДС (0..1)",
-            "duty_ad": "Пошлина (адвал., 0..1)",
-            "duty_sp": "Пошлина (специф., $/кг)",
-            "route": "Маршрут (CFR/CIF фрахт и страховка)",
-            "route_name": "Маршрут",
-            "freight": "Фрахт (USD)",
-            "insurance": "Страховка (USD)",
-            "fees": "Локальные сборы (стартер)",
-            "fee_name": "Название",
-            "fee_type": "Тип",
-            "fee_amount": "Сумма ($)",
-            "fee_rate": "Ставка (%)",
-            "fee_base": "База",
-            "fee_in_vat": "Включать в базу НДС",
-            "btn_calc": "Рассчитать",
-            "result": "Итог",
-            "landed_total": "Landed total (USD)",
-            "per_kg": "$/кг",
-            "summary": "Разбор",
-            "fill_and_calc": "Заполните поля и нажмите «Рассчитать».",
-            "auto_refresh": "Авто-обновление котировок (15 мин)",
-        },
-    }
-    return L.get(lang, {}).get(key) or L["en"].get(key) or key
+    return I18N.get(lang, I18N["en"]).get(key, key)
 
+# ---------- Language switch (top) ----------
+lang_prev = st.session_state["lang"]
+lang_choice = st.radio(
+    "🌐 " + T("lang_label"),
+    ["en", "ru"],
+    horizontal=True,
+    index=0 if lang_prev == "en" else 1,
+    format_func=lambda x: "English" if x == "en" else "Русский",
+)
+if lang_choice != lang_prev:
+    st.session_state["lang"] = lang_choice
+    st.rerun()
 
-# ============================ UTILITIES ================================
-def utc_now_str() -> str:
-    return datetime.now(timezone.utc).strftime("%H:%M UTC")
+# ---------- Header (logo + title + tagline) ----------
+col_l, col_c = st.columns([1, 2])
+with col_l:
+    if LOGO_PATH.exists():
+        st.image(str(LOGO_PATH), width=180)
+    else:
+        st.markdown(
+            f"<div style='font-weight:800;font-size:28px;color:{GRAPHITE}'>{APP_NAME}</div>",
+            unsafe_allow_html=True,
+        )
+with col_c:
+    st.markdown(
+        f"<div style='text-align:center;font-weight:800;font-size:34px;color:{GRAPHITE}'>{APP_NAME}</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<div style='text-align:center;color:#64748B'>{T('tagline')}</div>",
+        unsafe_allow_html=True,
+    )
+st.markdown("<hr style='margin-top:6px;margin-bottom:10px'/>", unsafe_allow_html=True)
 
+# ---------- Helpers: Stooq fetch ----------
 def kc_centslb_to_usdkg(x: float) -> float:
-    """¢/lb -> $/kg"""
     return (float(x) / 100.0) / 0.45359237
 
 def rm_usdt_to_usdkg(x: float) -> float:
-    """USD/tonne -> $/kg"""
     return float(x) / 1000.0
 
-def _http_get_text(url: str, params: dict | None = None, timeout: float = REQ_TIMEOUT) -> Tuple[Optional[str], Dict]:
+def _http_get_text(url: str, params: dict | None = None, timeout: float = REQ_TIMEOUT) -> tuple[Optional[str], Dict]:
     meta = {"url": url, "params": params, "status": None, "ctype": None, "err": None}
     try:
         r = requests.get(url, headers=UA, params=params, timeout=timeout)
@@ -170,7 +194,6 @@ def _http_get_text(url: str, params: dict | None = None, timeout: float = REQ_TI
         if not r.ok:
             return None, meta
         text = r.text
-        # фильтр на случай HTML/капчи
         if not text or "<html" in text.lower():
             return None, meta
         return text, meta
@@ -178,7 +201,7 @@ def _http_get_text(url: str, params: dict | None = None, timeout: float = REQ_TI
         meta["err"] = f"{type(e).__name__}: {e}"
         return None, meta
 
-def _try_domains(path: str, params: dict, retries: int = 3) -> Tuple[Optional[str], Dict]:
+def _try_domains(path: str, params: dict, retries: int = 3) -> tuple[Optional[str], Dict]:
     last_meta: Dict = {}
     for base in STOOQ_DOMAINS:
         for attempt in range(retries):
@@ -191,10 +214,10 @@ def _try_domains(path: str, params: dict, retries: int = 3) -> Tuple[Optional[st
     return None, last_meta
 
 def _parse_snapshot(text: str, expect_symbol: str) -> Optional[Dict]:
-    """Parse /q/l CSV: Symbol,Date,Time,Open,High,Low,Close,Volume."""
     reader = csv.DictReader(io.StringIO(text))
     row = next(reader, None)
-    if not row: return None
+    if not row:
+        return None
     symbol = (row.get("Symbol") or "").strip().upper()
     if symbol != expect_symbol.upper():
         return None
@@ -211,13 +234,13 @@ def _parse_snapshot(text: str, expect_symbol: str) -> Optional[Dict]:
     else:
         return None
     return {"last_raw": close, "unit": unit, "usdkg": usdkg,
-            "asof": f"{date} {time_} (snapshot)", "source": "Stooq /q/l"}
+            "asof": f"{date} {time_} (Stooq snapshot)", "source": "Stooq /q/l"}
 
 def _parse_eod(text: str, expect_symbol: str) -> Optional[Dict]:
-    """Parse /q/d/l CSV: Date,Open,High,Low,Close,Volume."""
     reader = csv.DictReader(io.StringIO(text))
     rows = list(reader)
-    if not rows: return None
+    if not rows:
+        return None
     last = rows[-1]
     try:
         close = float(last["Close"])
@@ -234,49 +257,95 @@ def _parse_eod(text: str, expect_symbol: str) -> Optional[Dict]:
             "asof": f"{date} (EOD)", "source": "Stooq /q/d/l"}
 
 @st.cache_data(ttl=STOOQ_CACHE_TTL)
-def stooq_latest(symbol: str, seed: int = 0, debug: bool = False) -> Dict:
-    """Snapshot first, fallback to EOD."""
+def stooq_latest(symbol: str, seed: int = 0) -> Dict:
+    """Try Stooq snapshot, then EOD CSV. Cached."""
     sym = symbol.upper()
-    snap_txt, snap_meta = _try_domains("/q/l/", params={"s": sym.lower(), "f": "sd2t2ohlcv", "h": "", "e": "csv"})
+    # snapshot
+    snap_txt, _ = _try_domains("/q/l/", params={"s": sym.lower(), "f": "sd2t2ohlcv", "h": "", "e": "csv"})
     if snap_txt:
         parsed = _parse_snapshot(snap_txt, sym)
         if parsed:
-            if debug: parsed["_debug"] = {"endpoint": "snapshot", **snap_meta}
             return parsed
-
-    eod_txt, eod_meta = _try_domains("/q/d/l/", params={"s": sym.lower(), "i": "d"})
+    # eod
+    eod_txt, _ = _try_domains("/q/d/l/", params={"s": sym.lower(), "i": "d"})
     if eod_txt:
         parsed = _parse_eod(eod_txt, sym)
         if parsed:
-            if debug: parsed["_debug"] = {"endpoint": "eod", **eod_meta}
             return parsed
+    raise RuntimeError(f"Stooq not available for {sym}")
 
-    meta = snap_meta if snap_meta else eod_meta
-    raise RuntimeError(f"Stooq not available for {sym} (status={meta.get('status')}, ctype={meta.get('ctype')}, err={meta.get('err')})")
+# ---------- Controls row (no sidebar) ----------
+for key, default in [("refresh_seed", 0), ("auto_refresh", False), ("last_check", None), ("last_fetch_ts", None)]:
+    st.session_state.setdefault(key, default)
 
-# ======================== QUOTE RENDER HELPERS =========================
-def metric_block(title: str, data: dict):
-    """Draws metric or friendly message if no data."""
-    val = data.get("last_raw")
-    unit = data.get("unit", "")
-    if val is not None:
-        st.metric(title, f"{val:.2f} {unit}")
-        usdkg = data.get("usdkg")
-        src = data.get("source", "")
-        asof = data.get("asof", "")
-        if usdkg is not None:
-            st.caption(f"{T('approx')} {usdkg:.3f} {T('usdkg')} • {T('source')}: {src} • {T('as_of')} {asof}")
-        else:
-            st.caption(f"{T('source')}: {src} • {T('as_of')} {asof}")
+ctl_l, ctl_r = st.columns([2, 1])
+with ctl_l:
+    clicked = st.button("↻ " + T("refresh"))
+    st.session_state["auto_refresh"] = st.toggle(T("auto_refresh"), value=st.session_state["auto_refresh"])
+    st.caption(f"{T('last_check')}: {st.session_state['last_check'] or '—'}")
+
+    if clicked:
+        st.session_state["refresh_seed"] += 1
+
+    # Safe timer (no st.autorefresh)
+    if st.session_state["auto_refresh"]:
+        last_ts = st.session_state.get("last_fetch_ts")
+        due = (last_ts is None) or ((datetime.now(timezone.utc) - last_ts).total_seconds() >= 900)
+        if due:
+            st.session_state["refresh_seed"] += 1
+            st.session_state["last_fetch_ts"] = datetime.now(timezone.utc)
+            st.experimental_rerun()
+
+with ctl_r:
+    st.markdown(
+        "<div style='text-align:right;color:#94A3B8'>Market — Stooq (safe boot)</div>",
+        unsafe_allow_html=True,
+    )
+
+# ---------- Fetch quotes once for the screen ----------
+kc, rm = {}, {}
+try:
+    kc = stooq_latest(ARABICA_SYMBOL, seed=st.session_state["refresh_seed"])
+except Exception:
+    kc = {}
+try:
+    rm = stooq_latest(ROBUSTA_SYMBOL, seed=st.session_state["refresh_seed"])
+except Exception:
+    rm = {}
+
+now_utc = datetime.now(timezone.utc)
+st.session_state["last_check"] = now_utc.strftime("%H:%M UTC")
+st.session_state["last_fetch_ts"] = now_utc
+
+# ---------- Top market strip ----------
+st.markdown(
+    f"<div style='margin-top:-4px;margin-bottom:8px;color:#64748B'>{T('market_title')}</div>",
+    unsafe_allow_html=True,
+)
+a, b = st.columns(2)
+with a:
+    if kc.get("last_raw") is not None:
+        st.metric(T("arabica"), f"{kc['last_raw']:.2f} {kc.get('unit','')}")
+        st.caption(f"{T('approx')} {kc.get('usdkg',0):.3f} {T('usdkg')} • {T('source')}: {kc.get('source','Stooq')} • {T('asof')} {kc.get('asof','')}")
     else:
-        st.error(T("no_quotes"))
+        st.warning(T("no_quotes_try_refresh"))
+with b:
+    if rm.get("last_raw") is not None:
+        st.metric(T("robusta"), f"{rm['last_raw']:.2f} {rm.get('unit','')}")
+        st.caption(f"{T('approx')} {rm.get('usdkg',0):.3f} {T('usdkg')} • {T('source')}: {rm.get('source','Stooq')} • {T('asof')} {rm.get('asof','')}")
+    else:
+        st.warning(T("no_quotes_try_refresh"))
 
-# ============================ CALCULATOR ================================
+st.markdown("<hr style='margin-top:8px;margin-bottom:14px'/>", unsafe_allow_html=True)
+
+# ---------- Calculator helpers ----------
 def compute_customs_value(incoterm: str, goods_value: float, freight: float, insurance: float) -> float:
     inc = incoterm.upper()
-    if inc in {"FOB", "EXW"}: return goods_value + freight + insurance
-    if inc == "CFR":          return goods_value + insurance
-    return goods_value  # CIF включает фрахт и страховку
+    if inc in {"FOB", "EXW"}:
+        return goods_value + freight + insurance
+    if inc == "CFR":
+        return goods_value + insurance
+    return goods_value  # CIF включает фрахт+страховку
 
 def compute_quote(usd_per_kg, weight_kg, incoterm, freight, insurance,
                   duty_rate, duty_sp_perkg, vat_rate, fees):
@@ -287,7 +356,8 @@ def compute_quote(usd_per_kg, weight_kg, incoterm, freight, insurance,
     duty_total = duty_ad + duty_sp
 
     def fee_amt(f):
-        if f["kind"] == "fixed": return float(f.get("amount", 0))
+        if f["kind"] == "fixed":
+            return float(f.get("amount", 0))
         base = f.get("base", "CV")
         base_val = cv if base == "CV" else goods_value if base == "Goods" else cv + duty_total
         return float(f.get("rate", 0)) * base_val
@@ -318,165 +388,36 @@ def make_result_df(b, currency="USD"):
         ["Landed total", b["total"], currency],
         ["Per kg", b["per_kg"], f"{currency}/kg"],
     ]
-    return pd.DataFrame(rows, columns=["Metric","Value","Unit"])
+    return pd.DataFrame(rows, columns=["Metric", "Value", "Unit"])
 
-def export_excel(b, calc_params):
-    df_main = make_result_df(b)
-    df_fees = pd.DataFrame([{"Fee": f["name"], "Amount": f["amount"], "In VAT base": f["vat_base"]} for f in b["fees"]])
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        pd.DataFrame([calc_params]).to_excel(writer, index=False, sheet_name="Input")
-        df_main.to_excel(writer, index=False, sheet_name="Result")
-        df_fees.to_excel(writer, index=False, sheet_name="Fees")
-    buf.seek(0)
-    return buf
+# ---------- Calculator UI ----------
+st.header(T("calculator"))
 
-def export_pdf(b, calc_params):
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.units import cm
-
-    buf = BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    w, h = A4
-    y = h - 2*cm
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(2*cm, y, f"{APP_NAME} — Summary")
-    y -= 1*cm
-    c.setFont("Helvetica", 10)
-    for k,v in calc_params.items():
-        c.drawString(2*cm, y, f"{k}: {v}")
-        y -= 0.5*cm
-        if y < 2*cm: c.showPage(); y = h - 2*cm; c.setFont("Helvetica", 10)
-    y -= 0.5*cm
-    lines = [
-        ("Customs value (CV)", b["customs_value"]),
-        ("Duty ad val.", b["duty_ad"]),
-        ("Duty specific", b["duty_sp"]),
-        ("Duty total", b["duty_total"]),
-        ("Fees total", b["fees_total"]),
-        ("VAT base", b["vat_base"]),
-        ("VAT", b["vat"]),
-        ("Landed total", b["total"]),
-        ("Per kg", b["per_kg"]),
-    ]
-    c.setFont("Helvetica-Bold", 11); c.drawString(2*cm, y, "Result"); y -= 0.7*cm; c.setFont("Helvetica", 10)
-    for name,val in lines:
-        c.drawString(2*cm, y, f"{name}: {val:,.4f} USD"); y -= 0.5*cm
-        if y < 2*cm: c.showPage(); y = h - 2*cm; c.setFont("Helvetica", 10)
-    c.showPage(); c.save(); buf.seek(0)
-    return buf
-
-# ============================== HEADER =================================
-# init session
-if "lang" not in st.session_state:
-    st.session_state["lang"] = "en"
-if "refresh_seed" not in st.session_state:
-    st.session_state["refresh_seed"] = 0
-if "net_ok" not in st.session_state:
-    st.session_state["net_ok"] = not SAFE_BOOT  # если SAFE_BOOT=True, ждём нажатия кнопки
-if "last_check" not in st.session_state:
-    st.session_state["last_check"] = None
-if "auto_refresh" not in st.session_state:
-    st.session_state["auto_refresh"] = False
-
-# top bar
-col_l, col_c, col_r = st.columns([1,1,1])
-with col_l:
-    if LOGO_PATH.exists():
-        st.image(str(LOGO_PATH), width=180)
-    else:
-        st.markdown(
-            f"<div style='font-weight:800;font-size:28px;color:{GRAPHITE}'>{APP_NAME}</div>",
-            unsafe_allow_html=True
-        )
-with col_c:
-    st.markdown(
-        f"<div style='text-align:center;font-weight:800;font-size:34px;color:{GRAPHITE}'>{APP_NAME}</div>",
-        unsafe_allow_html=True
-    )
-    st.markdown(
-        f"<div style='text-align:center;color:#64748B'>{T('tagline')}</div>",
-        unsafe_allow_html=True
-    )
-with col_r:
-    st.caption(f"🌐 {T('language')}")
-    lang_choice = st.radio("", ["en","ru"],
-                           index=0 if st.session_state["lang"]=="en" else 1,
-                           horizontal=True, label_visibility="collapsed",
-                           format_func=lambda x: T("english") if x=="en" else T("russian"))
-    st.session_state["lang"] = lang_choice
-
-st.markdown("<hr style='margin-top:6px;margin-bottom:6px'/>", unsafe_allow_html=True)
-
-# =============================== SIDEBAR ================================
-with st.sidebar:
-    st.subheader(T("market_title"))
-    if st.button(f"↻ {T('refresh')}"):
-        st.session_state["refresh_seed"] += 1
-        st.session_state["net_ok"] = True
-        st.session_state["last_check"] = utc_now_str()
-
-    st.toggle(T("auto_refresh"), key="auto_refresh")
-    if st.session_state["auto_refresh"]:
-        # каждые 15 минут (900_000 мс)
-        st.experimental_rerun = st.autorefresh(interval=900_000, key="auto_r")
-
-    last = st.session_state.get("last_check")
-    st.caption(f"{T('last_check')}: {last or '—'}")
-
-    # котировки только если разрешена сеть (safe boot)
-    kc, rm = {}, {}
-    if st.session_state["net_ok"]:
-        try:
-            kc = stooq_latest(ARABICA_SYMBOL, seed=st.session_state["refresh_seed"], debug=False)
-        except Exception:
-            kc = {}
-        try:
-            rm = stooq_latest(ROBUSTA_SYMBOL, seed=st.session_state["refresh_seed"], debug=False)
-        except Exception:
-            rm = {}
-    metric_block(T("arabica"), kc)
-    metric_block(T("robusta"), rm)
-    st.caption("Snapshot у Stooq может быть с задержкой; если недоступен — берём EOD.")
-
-# ============================== CALCULATOR UI ===========================
-st.header(T("calc"))
-
-src = st.radio(T("price_source"), [T("online"), T("manual")], horizontal=True)
+src = st.radio(T("price_source"), [T("online_stooq"), T("manual_input")], horizontal=True)
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    instrument = st.selectbox(T("instrument"), [T("arabica"), T("robusta")])
+    instrument = st.selectbox(T("instrument"), ["Arabica (KC.F)", "Robusta (RM.F)"])
 
 with col2:
-    if src == T("online"):
-        if instrument.startswith("Arabica") or instrument.startswith("Арабика"):
-            market = kc.get("usdkg")
-            if market is None:
-                st.warning(T("no_quotes"))
-                base_usdkg = st.number_input(T("base_price"), min_value=0.0, value=3.000, step=0.001)
-            else:
-                st.text_input(T("base_from_kc"), value=f"{market:.4f}", disabled=True)
-                base_usdkg = float(market)
+    if src == T("online_stooq"):
+        market_usdkg = kc.get("usdkg") if instrument.startswith("Arabica") else rm.get("usdkg")
+        if market_usdkg is None:
+            st.warning(T("no_quotes_try_refresh"))
+            base_usdkg = st.number_input(T("base_price"), min_value=0.0, value=3.000, step=0.001)
         else:
-            market = rm.get("usdkg")
-            if market is None:
-                st.warning(T("no_quotes"))
-                base_usdkg = st.number_input(T("base_price"), min_value=0.0, value=3.000, step=0.001)
-            else:
-                st.text_input(T("base_from_rm"), value=f"{market:.4f}", disabled=True)
-                base_usdkg = float(market)
+            st.text_input(T("base_price_from_market"), value=f"{market_usdkg:.4f}", disabled=True)
+            base_usdkg = float(market_usdkg)
     else:
         base_usdkg = st.number_input(T("base_price"), min_value=0.0, value=3.000, step=0.001)
 
 with col3:
-    diff = st.number_input(T("diff"), value=0.000, step=0.010)
+    diff = st.number_input(T("diff_per_kg"), value=0.000, step=0.010, help=T("diff_help"))
 
 effective_usdkg = base_usdkg + diff
 st.caption(f"{T('effective_price')}: **{effective_usdkg:.4f} {T('usdkg')}**")
 
-# контейнер / вес
+# Container / weight
 st.markdown(f"**{T('container_weight')}**")
 colw1, colw2, colw3 = st.columns(3)
 with colw1:
@@ -489,35 +430,37 @@ with colw2:
     else:
         weight_kg = st.number_input(T("weight"), min_value=1.0, value=1000.0, step=100.0)
 with colw3:
-    incoterm = st.selectbox(T("incoterm"), ["FOB","CFR","CIF"])
+    incoterm = st.selectbox(T("incoterm"), ["FOB", "CFR", "CIF"])
 
-# юрисдикции (простые пресеты)
+# Jurisdiction presets
 st.markdown(f"**{T('jurisdiction')}**")
 jur_presets = {
     "EAEU - Belarus": {"vat_rate": 0.20, "duty_rate": 0.00},
-    "EAEU - Russia":  {"vat_rate": 0.20, "duty_rate": 0.00},
-    "UAE":            {"vat_rate": 0.05, "duty_rate": 0.00},
+    "EAEU - Russia": {"vat_rate": 0.20, "duty_rate": 0.00},
+    "UAE": {"vat_rate": 0.05, "duty_rate": 0.00},
 }
 colsj1, colsj2 = st.columns(2)
 with colsj1:
     jname = st.selectbox(T("country_region"), list(jur_presets.keys()))
 with colsj2:
     j = jur_presets[jname]
-    vat_rate = st.number_input(T("vat_rate"), min_value=0.0, max_value=1.0, value=float(j.get("vat_rate", 0.0)), step=0.01)
-duty_rate = st.number_input(T("duty_ad"), min_value=0.0, max_value=1.0, value=float(j.get("duty_rate", 0.0)), step=0.01)
+    vat_rate = st.number_input(T("vat_rate"), min_value=0.0, max_value=1.0,
+                               value=float(j.get("vat_rate", 0.0)), step=0.01)
+duty_rate = st.number_input(T("duty_ad"), min_value=0.0, max_value=1.0,
+                            value=float(j.get("duty_rate", 0.0)), step=0.01)
 duty_sp_perkg = st.number_input(T("duty_sp"), min_value=0.0, value=0.0, step=0.01)
 
-# маршруты (пресеты для CFR/CIF)
+# Route presets
 st.markdown(f"**{T('route')}**")
 route_presets = {
-    "Santos → Riga":     {"incoterms": ["CFR","CIF"], "freight": 1800, "insurance": 80},
-    "Santos → Dubai":    {"incoterms": ["CFR","CIF"], "freight": 1600, "insurance": 70},
-    "Jebel Ali → Riyadh":{"incoterms": ["CFR","CIF"], "freight": 600,  "insurance": 40},
+    "Santos → Riga": {"incoterms": ["CFR", "CIF"], "freight": 1800, "insurance": 80},
+    "Santos → Dubai": {"incoterms": ["CFR", "CIF"], "freight": 1600, "insurance": 70},
+    "Jebel Ali → Riyadh": {"incoterms": ["CFR", "CIF"], "freight": 600, "insurance": 40},
 }
 route_names = ["(none)"] + list(route_presets.keys())
 colr1, colr2, colr3 = st.columns(3)
 with colr1:
-    rsel = st.selectbox(T("route_name"), route_names)
+    rsel = st.selectbox("Route", route_names)
 with colr2:
     if rsel != "(none)" and incoterm in route_presets[rsel]["incoterms"]:
         freight = st.number_input(T("freight"), min_value=0.0, value=float(route_presets[rsel]["freight"]), step=10.0)
@@ -529,29 +472,34 @@ with colr3:
     else:
         insurance = st.number_input(T("insurance"), min_value=0.0, value=80.0, step=5.0)
 
-# fees (одна строка — стартер)
-st.markdown(f"**{T('fees')}**")
-feec1, feec2, feec3, feec4, _ = st.columns([2,1,1,1,1])
+# Local fees (starter)
+st.markdown(f"**{T('local_fees')}**")
+feec1, feec2, feec3, feec4, _ = st.columns([2, 1, 1, 1, 1])
 with feec1:
     fee_name = st.text_input(T("fee_name"), value="Customs processing")
 with feec2:
-    fee_kind = st.selectbox(T("fee_type"), ["fixed","percent"])
+    fee_kind = st.selectbox(T("fee_type"), [T("fee_fixed"), T("fee_percent")])
+    fk_internal = "fixed" if fee_kind.startswith(("fixed", "фикс")) else "percent"
 with feec3:
-    if fee_kind == "fixed":
+    if fk_internal == "fixed":
         fee_amount = st.number_input(T("fee_amount"), min_value=0.0, value=25.0, step=1.0)
-        fee_rate = 0.0; fee_base = "CV"
+        fee_rate = 0.0
+        fee_base = "CV"
     else:
         fee_rate = st.number_input(T("fee_rate"), min_value=0.0, value=0.0, step=0.1) / 100.0
-        fee_base = st.selectbox(T("fee_base"), ["CV","Goods","CVPlusDuty"])
+        fee_base = st.selectbox(T("fee_base"), ["CV", "Goods", "CVPlusDuty"])
         fee_amount = 0.0
 with feec4:
-    fee_vb = st.checkbox(T("fee_in_vat"), value=True)
-fees = [{"name": fee_name, "kind": fee_kind, "amount": fee_amount,
-         "rate": fee_rate, "base": fee_base, "vat_base": fee_vb}]
+    fee_vb = st.checkbox(T("fee_vat_base"), value=True)
+
+fees = [{
+    "name": fee_name, "kind": fk_internal, "amount": fee_amount,
+    "rate": fee_rate, "base": fee_base, "vat_base": fee_vb
+}]
 
 st.divider()
 
-if st.button(T("btn_calc"), type="primary"):
+if st.button(T("compute"), type="primary"):
     b = compute_quote(
         usd_per_kg=float(effective_usdkg),
         weight_kg=float(weight_kg),
@@ -563,39 +511,16 @@ if st.button(T("btn_calc"), type="primary"):
         vat_rate=float(vat_rate),
         fees=fees
     )
-    colL, colR = st.columns([1,1])
+
+    colL, colR = st.columns([1, 1])
     with colL:
         st.subheader(T("result"))
         st.metric(T("landed_total"), f"{b['total']:.2f}")
-        st.metric(T("per_kg"), f"{b['per_kg']:.4f}")
+        st.metric(T("usd_per_kg"), f"{b['per_kg']:.4f}")
         st.write(f"Incoterm: {incoterm} • {T('weight')}: {weight_kg:,.0f} kg • {T('country_region')}: {jname}")
-        st.write(f"{T('freight')}: {freight:.2f} • {T('insurance')}: {insurance:.2f} • {T('diff')}: {diff:+.3f} {T('usdkg')}")
-    with colR:
-        st.subheader(T("summary"))
-        st.dataframe(make_result_df(b), hide_index=True, use_container_width=True)
+        st.write(f"{T('freight')}: {freight:.2f} • {T('insurance')}: {insurance:.2f} • Δ: {diff:+.3f} $/kg")
 
-    # экспорт
-    calc_params = {
-        "Instrument": instrument,
-        "Base USD/kg": f"{base_usdkg:.4f}",
-        "Differential USD/kg": f"{diff:+.4f}",
-        "Effective USD/kg": f"{effective_usdkg:.4f}",
-        "Weight kg": weight_kg,
-        "Incoterm": incoterm,
-        "Freight USD": freight,
-        "Insurance USD": insurance,
-        "VAT rate": vat_rate,
-        "Duty ad val.": duty_rate,
-        "Duty specific $/kg": duty_sp_perkg,
-        "Jurisdiction": jname,
-        "Route": rsel,
-    }
-    excel_buf = export_excel(b, calc_params)
-    st.download_button("⬇️ Excel", data=excel_buf, file_name="landed_cost.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    csv = make_result_df(b).to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ CSV", data=csv, file_name="result.csv", mime="text/csv")
-    pdf_buf = export_pdf(b, calc_params)
-    st.download_button("⬇️ PDF", data=pdf_buf, file_name="summary.pdf", mime="application/pdf")
+    with colR:
+        st.dataframe(make_result_df(b), hide_index=True, use_container_width=True)
 else:
-    st.info(T("fill_and_calc"))
+    st.info(T("fill_and_compute"))
